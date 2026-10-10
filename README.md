@@ -18,10 +18,12 @@ Try Tokio after setup, choosing an unused clone destination:
 
 ```bash
 git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap"
-./verus-gap "$HOME/tokio-verus-gap/tokio" --features full --jobs 32 --verbose
+./verus-gap "$HOME/tokio-verus-gap/tokio" --jobs 32 --verbose
 ```
 
-This selects the Tokio library crate, explicitly enables its `full` feature, and shows live progress. **Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
+This selects the Tokio library and keeps its default Cargo features. Tokio enables none by default; add `--features full` only when you want to investigate its optional runtime, networking, and other APIs.
+
+**Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
 
 For your own crate:
 
