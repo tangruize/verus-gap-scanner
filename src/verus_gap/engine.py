@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .gap import GapError, run, save_run
-from .project import Project, scan_level_from, write_json
+from .project import DEFAULT_SCAN_LEVEL, Project, scan_level_from, write_json
 from .source import Declaration, Rendered
 
 
@@ -437,7 +437,7 @@ def dependencies(project: Project, state: State, records: list[dict],
 
 
 def probe(project: Project, focus: str, output: Path, max_rounds: int | None = None,
-          per_run: float = 60, scan_level: int = 0,
+          per_run: float = 60, scan_level: int = DEFAULT_SCAN_LEVEL,
           progress: Callable[[str, dict], None] | None = None) -> dict:
     def notify(phase: str, **details):
         if progress is not None:

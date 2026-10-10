@@ -19,6 +19,9 @@ from .gap import (
 from .source import Cfg, Source
 
 
+DEFAULT_SCAN_LEVEL = 2
+
+
 def write_json(path: Path, payload: dict):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -158,7 +161,7 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         "target": target["name"] if target else root.stem,
         "manifest_relative": str(manifest_path.relative_to(source_root)) if manifest_path else None,
         "ghost_dependencies_required": ghost_dependencies,
-        "scan_level": getattr(args, "scan_level", 0),
+        "scan_level": getattr(args, "scan_level", DEFAULT_SCAN_LEVEL),
         "cargo_args": cargo_args, "source_sha256": hashes,
         "verus": version, "verus_executable": str(verus),
         "tool_sha256": {

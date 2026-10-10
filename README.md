@@ -1,6 +1,6 @@
 # Verus Gap
 
-Find Rust constructs and library APIs that **the installed Verus cannot check in your project's real build context**. The scanner builds a copy, probes active files independently, isolates observed blockers, follows resolvable local dependencies, and writes a grouped report. It never edits the input project or invents specifications.
+Find Rust constructs and library APIs that **the installed Verus cannot check in your project's real build context**. The scanner builds a copy, probes active files independently, isolates observed blockers, and writes a grouped report. By default, it looks for quick initial findings in the selected code; deeper exploration is available with `--scan-level`. It never edits the input project or invents specifications.
 
 ## Install once
 
@@ -23,7 +23,7 @@ Already have a complete Verus distribution? Use `./setup --verus /absolute/path/
 
 The demo intentionally reports missing `std::time::Instant` models and exits with code 1. The real command automatically discovers Cargo, builds the unchanged crate with Verus's matching Rust, and scans its active files. A crate-defined `full` feature is selected automatically; otherwise Cargo's default features are retained.
 
-A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**. The scanner keeps the real target, features, generated files, and Cargo build context; it does not treat the chosen file as a dependency-free snippet. By default, it also investigates resolvable local dependencies that block checking, labeling their findings separately from selected-source findings. A standalone `.rs` file works too. For an ambiguous workspace, use `--package NAME`; for different features, use `--features FEATURE`, or pass normal Cargo options after `--`.
+A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**. The scanner keeps the real target, features, generated files, and Cargo build context; it does not treat the chosen file as a dependency-free snippet. Default scans keep Verus checking and reported findings within your selected source. Use `--scan-level 0` to also investigate resolvable local dependencies that block checking, labeling their findings separately. A standalone `.rs` file works too. For an ambiguous workspace, use `--package NAME`; for different features, use `--features FEATURE`, or pass normal Cargo options after `--`.
 
 ```bash
 ./verus-gap /path/to/crate --file 'src/write/*.rs'
@@ -31,27 +31,28 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 ./verus-gap --resume /path/to/verus-gap-results/RESULT
 ```
 
-Choose the exploration policy with **`--scan-level {0,1,2}`**. The default is **0**; **`--fast` is an alias for level 2**.
+Choose the exploration policy with **`--scan-level {0,1,2}`**. New scans default to **2**, so no level option is needed for quick initial findings.
 
 | Level | What it does | When to choose it |
 |---|---|---|
 | `0` | Investigate selected source and local dependencies needed to continue checking | You also want dependency findings |
 | `1` | Stay in selected source, trying to work around checking obstacles to find more gaps | You want a deeper look at the selected code |
-| `2` / `--fast` | Stay in selected source, stopping when only checking obstacles remain | You want quick initial findings |
+| `2` (default) | Stay in selected source, stopping when only checking obstacles remain | You want quick initial findings |
 
 ```bash
+./verus-gap /path/to/crate/src/write/encoder.rs --verbose
 ./verus-gap /path/to/crate/src/write/encoder.rs --scan-level 1
-./verus-gap /path/to/crate/src/write/encoder.rs --fast --verbose
+./verus-gap /path/to/crate/src/write/encoder.rs --scan-level 0
 ```
 
 All levels use the same build checks and confirm each new support finding with a second run of the same code copy. Levels 1 and 2 check and report only the selected source, without expanding checking into dependency files. The difference is how long they keep looking, not how strongly they confirm a finding. Levels are not fixed runtime guarantees, and none guarantees that every gap will be found.
 
-A **checking boundary** means Verus cannot currently use a referenced type, function, or trait because it is outside checking or has been explicitly excluded. This can happen inside your selected file as well as at a dependency. It is a checking obstacle, not automatically a Verus language or library-model gap. Level 1 keeps trying to work around these obstacles; level 2 stops when they are the only errors left, with no setup or instrumentation blocker. The report stays **partial** and retains those errors in `review.md`; more gaps may be hidden behind them. Conflicting options such as `--fast --scan-level 1` are rejected.
+A **checking boundary** means Verus cannot currently use a referenced type, function, or trait because it is outside checking or has been explicitly excluded. This can happen inside your selected file as well as at a dependency. It is a checking obstacle, not automatically a Verus language or library-model gap. Level 1 keeps trying to work around these obstacles; level 2 stops when they are the only errors left, with no setup or instrumentation blocker. The report stays **partial** and retains those errors in `review.md`; more gaps may be hidden behind them.
 
 Add **`--verbose`** to see live probe/confirmation phases, round timings, scope expansion or exclusion actions, cumulative group counts, and newly confirmed limitations with original error messages and source locations:
 
 ```bash
-./verus-gap /path/to/crate/src/write/encoder.rs --fast --verbose
+./verus-gap /path/to/crate/src/write/encoder.rs --verbose
 ./verus-gap --resume /path/to/verus-gap-results/RESULT --verbose
 ```
 

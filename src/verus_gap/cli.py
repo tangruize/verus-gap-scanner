@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .engine import canonical, probe
 from .gap import GapError
-from .project import Project, prepare, resume, scan_level_from, write_json
+from .project import DEFAULT_SCAN_LEVEL, Project, prepare, resume, scan_level_from, write_json
 from .report import atomic_text, main as report_main, public_api, report_lock, save_report
 
 
@@ -202,9 +202,6 @@ def main(argv: list[str] | None = None) -> int:
         if any(option == "--scan-level" or option.startswith("--scan-level=") for option in options):
             print("error: --scan-level is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
             return 2
-        if "--fast" in options:
-            print("error: --fast is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
-            return 2
         if "--verbose" in options:
             print("error: --verbose is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
             return 2
@@ -225,10 +222,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bin", help="binary target when there is no unique library")
     parser.add_argument("--file", action="append", default=[], help="file or glob relative to workspace or crate")
     parser.add_argument("--scan-level", type=int, choices=(0, 1, 2),
-                        help="0: expand dependencies (default); 1: selected source with continued isolation; "
-                             "2: selected source, stop when only checking boundaries remain; resume inherits its level")
-    parser.add_argument("--fast", action="store_true",
-                        help="alias for --scan-level 2")
+                        help="0: expand dependencies; 1: selected source with continued isolation; "
+                             "2: selected source, stop when only checking boundaries remain "
+                             "(default for new scans); resume inherits its level")
     parser.add_argument("--verbose", action="store_true",
                         help="show live round progress and newly confirmed limitation groups")
     parser.add_argument("--out", help="new result directory")
@@ -238,9 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(values)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    if args.fast and args.scan_level not in (None, 2):
-        parser.error("--fast is --scan-level 2; do not combine it with a different --scan-level")
-    requested_level = 2 if args.fast else args.scan_level
+    requested_level = args.scan_level
     if args.features:
         cargo.extend(["--features", args.features])
     if args.path == "demo":
@@ -259,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     project = None
     reporting = None
     try:
-        level = 0 if requested_level is None else requested_level
+        level = DEFAULT_SCAN_LEVEL if requested_level is None else requested_level
         if args.resume:
             previous = json.loads((output / "project.json").read_text())
             try:

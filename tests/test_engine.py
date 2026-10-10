@@ -72,6 +72,25 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(report["observations"][0]["message"], boundary["message"])
         self.assertFalse(report["rounds"][0]["confirmation_performed"])
 
+    def test_probe_defaults_to_level_2_without_dependency_expansion_or_boundary_isolation(self):
+        project = SimpleNamespace(
+            manifest={"tool_sha256": {}}, sources={}, deadline=time.monotonic() + 30,
+            verify_originals=mock.Mock(),
+        )
+        result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "verus_gap.engine.execute", return_value=(result, [self.boundary()], ""),
+        ) as executing, mock.patch("verus_gap.engine.refine") as refining, mock.patch(
+            "verus_gap.engine.dependencies",
+        ) as expanding:
+            report = probe(project, "lib.rs", Path(directory), max_rounds=2)
+        executing.assert_called_once()
+        refining.assert_not_called()
+        expanding.assert_not_called()
+        self.assertEqual(report["scan_level"], 2)
+        self.assertEqual(report["stop_reason"], "checking_boundary_only")
+        self.assertEqual(report["scope"], ["lib.rs"])
+
     def test_level_2_confirms_support_before_stopping_on_a_later_boundary_only_round(self):
         support, boundary = self.support(), self.boundary()
         progress = mock.Mock()
@@ -467,7 +486,7 @@ class RealInventoryTests(unittest.TestCase):
         self.assertFalse((project / "target").exists())
         return process, output
 
-    def test_fast_verbose_streams_saved_confirmed_findings_before_the_frontier_ends(self):
+    def test_default_verbose_matches_explicit_level_2_and_streams_confirmed_findings(self):
         files = {
             "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
             "src/lib.rs": "mod selected;\nmod helper;\n",
@@ -486,7 +505,7 @@ class RealInventoryTests(unittest.TestCase):
                 path.write_text(text)
             with subprocess.Popen(
                 [str(ROOT / "verus-gap"), str(project / "src/selected.rs"), "--out", str(output),
-                 "--fast", "--verbose", "--timeout", "30"],
+                 "--verbose", "--timeout", "30"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             ) as process:
                 try:
@@ -722,9 +741,9 @@ class RealInventoryTests(unittest.TestCase):
         self.assertIn("[scan] level=1", resumed.stdout)
         self.assertEqual((output / "baseline.stdout").stat().st_mtime_ns, baseline_timestamp)
 
-    def test_fast_resume_inherits_mode_and_retains_existing_evidence(self):
+    def test_default_level_2_resume_retains_existing_evidence(self):
         process, output = self.scan(
-            {"lib.rs": "pub fn gap() { let _ = std::time::Instant::now(); }\n"}, "--fast",
+            {"lib.rs": "pub fn gap() { let _ = std::time::Instant::now(); }\n"},
         )
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
@@ -750,7 +769,7 @@ class RealInventoryTests(unittest.TestCase):
         self.assertNotIn("[reuse]", quiet_resume.stdout)
         self.assertEqual(evidence.stat().st_mtime_ns, timestamp)
 
-    def test_fast_directory_checks_all_selected_files_but_no_other_files(self):
+    def test_default_directory_checks_all_selected_files_but_no_other_files(self):
         files = {
             "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
             "src/lib.rs": "mod selected;\nmod unrelated;\n",
@@ -759,7 +778,7 @@ class RealInventoryTests(unittest.TestCase):
             "src/selected/second.rs": "pub fn second(value: &mut u32) { let _ = std::mem::replace(value, 2); }\n",
             "src/unrelated.rs": "pub struct Unrelated; unsafe impl Send for Unrelated {}\n",
         }
-        process, output = self.scan(files, "--fast", target_relative="src/selected")
+        process, output = self.scan(files, target_relative="src/selected")
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["coverage"]["selected_files"], 3)
@@ -769,12 +788,14 @@ class RealInventoryTests(unittest.TestCase):
         self.assertNotIn("language_rejection", report["counts"])
         self.assertTrue(all(shard["scope"] == [shard["focus"]] for shard in report["shards"]))
 
-    def test_adaptive_resume_cannot_be_silently_changed_to_fast(self):
-        process, output = self.scan({"lib.rs": "pub fn good() -> u32 { 1 }\n"})
+    def test_level_0_resume_rejects_a_different_explicit_level(self):
+        process, output = self.scan(
+            {"lib.rs": "pub fn good() -> u32 { 1 }\n"}, "--scan-level", "0",
+        )
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         before = {name: (output / name).read_bytes() for name in ("project.json", "report.md", "report.json")}
         self.assertEqual(json.loads(before["project.json"])["scan_level"], 0)
-        for options in (["--fast"], ["--scan-level", "1"], ["--scan-level", "2"]):
+        for options in (["--scan-level", "1"], ["--scan-level", "2"]):
             with self.subTest(options=options):
                 resumed = subprocess.run(
                     [str(ROOT / "verus-gap"), "--resume", str(output), *options],
@@ -785,14 +806,14 @@ class RealInventoryTests(unittest.TestCase):
                 for name, data in before.items():
                     self.assertEqual((output / name).read_bytes(), data)
 
-    def test_fast_boundary_only_scan_does_not_claim_a_clear_frontier(self):
+    def test_default_boundary_only_scan_does_not_claim_a_clear_frontier(self):
         files = {
             "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
             "src/lib.rs": "mod selected;\nmod helper;\n",
             "src/selected.rs": "pub fn run() -> usize { crate::helper::value() }\n",
             "src/helper.rs": "pub fn value() -> usize { 1 }\n",
         }
-        process, output = self.scan(files, "--fast", target_relative="src/selected.rs")
+        process, output = self.scan(files, target_relative="src/selected.rs")
         self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertNotIn("library_specification", report["counts"])
@@ -855,7 +876,9 @@ class RealInventoryTests(unittest.TestCase):
                 "let _ = std::time::Instant::now(); 1"
             )
             files[f"src/chain{index}.rs"] = f"pub fn value() -> usize {{ {body} }}\n"
-        process, output = self.scan(files, "--verbose", target_relative="src/selected.rs")
+        process, output = self.scan(
+            files, "--scan-level", "0", "--verbose", target_relative="src/selected.rs",
+        )
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["coverage"]["selected_files"], 1)
@@ -886,7 +909,7 @@ class RealInventoryTests(unittest.TestCase):
             "src/leaf.rs": "pub fn value() -> usize { let _ = std::time::Instant::now(); 1 }\n",
             "src/unrelated.rs": "pub struct Unrelated; unsafe impl Send for Unrelated {}\n",
         }
-        process, output = self.scan(files, target_relative="src/selected")
+        process, output = self.scan(files, "--scan-level", "0", target_relative="src/selected")
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["coverage"]["selected_files"], 1)
@@ -920,7 +943,7 @@ class RealInventoryTests(unittest.TestCase):
             "Cargo.toml": manifest, "src/lib.rs": "mod child;\npub fn f(_value: child::S) {}\n",
             "src/child.rs": "pub struct S;\n",
         }
-        process, output = self.scan(files, "--file", "lib.rs")
+        process, output = self.scan(files, "--file", "lib.rs", "--scan-level", "0")
         self.assertIn(process.returncode, {0, 2}, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertNotIn("library_specification", report["counts"])

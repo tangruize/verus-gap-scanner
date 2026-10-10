@@ -18,26 +18,28 @@ The conservative revision (`4040d79a6756`, commit `7dfba68`) passes **122 tests*
 
 ## Focused fast mode
 
-The fast-mode revision (`112fdd0b3755`) passes **128 tests**. Fast-mode regressions cover actual Cargo file/directory scopes, retained features, no recursive dependency-body checking, selected-only primary and related locations, unchanged raw diagnostics, explicitly partial dependency-limited frontiers, inherited mode on resume, and refusal to convert an existing default scan into fast mode.
+The fast-mode revision (`112fdd0b3755`) passes **128 tests**. Fast-mode regressions cover actual Cargo file/directory scopes, retained features, no recursive dependency-body checking, selected-only primary and related locations, unchanged raw diagnostics, explicitly partial dependency-limited frontiers, inherited mode on resume, and refusal to change an existing scan's recorded exploration policy.
 
-Fast mode is a deliberate scope tradeoff, not a semantics-preserving optimization of the default exploration policy. It retains the native build and source-preparation controls, but does not cross local checking boundaries into unselected files. An encountered boundary keeps the frontier partial even if later exclusions remove the final compiler errors. File shards remain independent even when several files or a directory are selected.
+Focused checking is a deliberate scope tradeoff, not a semantics-preserving optimization of dependency-expanding exploration. It retains the native build and source-preparation controls, but does not cross local checking boundaries into unselected files. An encountered boundary keeps the frontier partial even if later exclusions remove the final compiler errors. File shards remain independent even when several files or a directory are selected.
 
 The published 114-test source/wheel archives remain unchanged. These conservative and fast-mode revisions are available in the checkout; the old archives do not contain them.
 
 ## Scan levels
 
-`--scan-level 0` is the default dependency-expanding policy. Level 1 retains selected-source-only continued isolation. Level 2, also available as `--fast`, ends a frontier before further isolation when its current error diagnostics are only checking boundaries, excluding compiler summaries. Setup/instrumentation blockers, other errors, timeouts and compiler failures do not satisfy this early-stop condition. New support observations keep the same repeated-confirmation requirement at every level.
+New scans default to level 2. `--scan-level 0` explicitly selects dependency-expanding investigation, and level 1 retains selected-source-only continued isolation. Level 2 ends a frontier before further isolation when its current error diagnostics are only checking boundaries, excluding compiler summaries. Setup/instrumentation blockers, other errors, timeouts and compiler failures do not satisfy this early-stop condition. New support observations keep the same repeated-confirmation requirement at every level.
 
 The project, shard, grouped report and follow-up tasks record the numeric level. Resume inherits it, rejects a conflicting explicit level, and reuses deliberately finished `checking_boundary_only` frontiers without new compiler calls. Those frontiers retain unresolved raw evidence and remain partial; a higher level can miss support gaps hidden behind the checking boundary. Levels describe exploration depth, not a fixed number of seconds.
 
-The final targeted 47-test run passes CLI, classification, confirmation, early-stop, reporting, real streamed alias/numeric-level equivalence, and real level-1 resume controls. Additional real Cargo/Verus controls exercise default dependency expansion, selected directories, boundary-only partial reports, preserved native features and cached evidence. Python 3.11 grammar checks pass for all seven changed Python files.
+The current default-policy and report-refresh regression run passes **91 tests** across `test_cli`, `test_report`, and `test_engine`, including real Cargo/Verus controls. Default and explicit level-2 runs retain identical counts, coverage, exclusions, and round/confirmation states. Resume preserves each saved level rather than applying the new default. Other controls cover rejected unknown options, explicit level-0 dependency expansion, level-1 continuation, boundary-only partial reports, Ctrl+C restoration, and evidence-only manual refresh. Python 3.11 grammar checks pass for all 21 source and test modules.
+
+The recorded targeted 47-test run passed CLI, classification, confirmation, early-stop, reporting, real streamed level-2 output, and real level-1 resume controls. Additional real Cargo/Verus controls exercised level-0 dependency expansion, selected directories, boundary-only partial reports, preserved native features and cached evidence. Python 3.11 grammar checks passed for all seven changed Python files.
 
 Sequential pinned Tokio mutex runs use the same source, dependency lock, Cargo targets/profiles/features, and compiler/support identities as the earlier comparison:
 
 | Policy | Whole-command seconds | Scan-phase seconds | Compiler seconds | Exploration / confirmation calls | Language / model groups |
 |---|---:|---:|---:|---:|---:|
 | Level 1, continued selected-source isolation | 84.353 | 70.5 | 69.149 | 34 / 4 | 5 / 10 |
-| Level 2 (`--fast`), boundary-only early stop | 29.368 | 16.0 | 15.835 | 5 / 4 | 5 / 10 |
+| Level 2, boundary-only early stop | 29.368 | 16.0 | 15.835 | 5 / 4 | 5 / 10 |
 
 Level 1 exactly retains the prior focused policy's 34 state fingerprints, exclusions, diagnostic counts, 39 accepted observation keys, and primary/related source positions. Level 2 retains all those accepted observations, 39 primary and 11 related positions, and the identical first five state fingerprints. It stops at round 004, the first boundary-only round, with 32 body and 13 declaration exclusions instead of 36 and 65. Its recorded checking-boundary groups decrease from 18 to 12 because later boundary cleanup is deliberately not performed, not because those items became supported. Both frontiers remain partial.
 
@@ -61,11 +63,11 @@ Wall measurements include native setup/controls and scanning but exclude earlier
 
 ## Live verbose output
 
-`--verbose` observes existing probe, confirmation, checkpoint and isolation/expansion events. It changes terminal output only; it does not add compiler calls, change source overlays, persist a new scan mode, or replace the final reports. New limitation notices require a stored confirmed support observation, and group identities reuse canonical messages and public API names. Default output labels dependency context separately; fast output keeps primary locations in selected source. Cached/resumed observations seed counts without being announced again.
+`--verbose` observes existing probe, confirmation, checkpoint and isolation/expansion events. It changes terminal output only; it does not add compiler calls, change source overlays, persist a new scan mode, or replace the final reports. New limitation notices require a stored confirmed support observation, and group identities reuse canonical messages and public API names. Level-0 output labels dependency context separately; level-1/2 output keeps primary locations in selected source. Cached/resumed observations seed counts without being announced again.
 
 Related CLI, engine/report and actual Cargo/Verus regressions pass. A pipe-based real fixture receives a flushed limitation before its frontier finishes and verifies that both initial/confirmation evidence and the accepted checkpoint already exist. Quiet and verbose runs retain identical counts, exclusions, scope events and round/confirmation states. Additional controls cover non-support/unconfirmed filtering, exact raw messages, public-API grouping, immutable records, cached resume with verbosity enabled then disabled, and ordinary dependency expansion in verbose mode.
 
-The actual pinned Tokio mutex `--fast --verbose` run retains all 15 support groups, 39 accepted observations, 39 primary and 11 related positions, all 34 round-state fingerprints, the same exclusions and deliberately partial frontier, and the same 38 compiler calls (34 probes and four confirmations). Every live group matches its unchanged accepted diagnostic and selected-source primary location; no group is announced twice. Its first limitation appears 3.5 seconds after scanning starts, all 15 groups are visible by 10.5 seconds, and the final round finishes at 70.2 seconds. Those progress timestamps exclude native setup; the full command took 83.715 seconds on the shared host. Independent result-equivalence and repeated-evidence audits pass. This is a live-output check, not another general speedup claim.
+The recorded pinned Tokio mutex focused verbose run retained all 15 support groups, 39 accepted observations, 39 primary and 11 related positions, all 34 round-state fingerprints, the same exclusions and deliberately partial frontier, and the same 38 compiler calls (34 probes and four confirmations). Every live group matched its unchanged accepted diagnostic and selected-source primary location; no group was announced twice. Its first limitation appeared 3.5 seconds after scanning started, all 15 groups were visible by 10.5 seconds, and the final round finished at 70.2 seconds. Those progress timestamps exclude native setup; the full command took 83.715 seconds on the shared host. Independent result-equivalence and repeated-evidence audits passed. This is a live-output check, not another general speedup claim.
 
 ## Controls against misleading findings
 
@@ -77,7 +79,7 @@ An independent model control used both the official host distribution and Nanvix
 
 ## Selected ranges and dependencies
 
-Actual file and directory inputs retain their containing Cargo root and features. A real nine-hop file-scope regression reaches the leaf's `Instant` diagnostic without checking an unrelated unsafe impl; a directory-scope regression retains features and follows two dependency hops. The production Tokio mutex-file experiment retains `full` Cargo context and reaches 69 additional source files. Its selected-source groups are reported separately from the larger checking context.
+Actual file and directory inputs retain their containing Cargo root and features. Explicit level-0 regressions follow nine dependency hops from a selected file and two from a selected directory, exposing the leaf's `Instant` diagnostic without checking an unrelated unsafe impl. The recorded dependency-expanding Tokio mutex-file experiment retains `full` Cargo context and reaches 69 additional source files. Its selected-source groups are reported separately from the larger checking context.
 
 Local checking expansion follows uniquely indexed function/type boundaries without an arbitrary seven-file cap. It is diagnostic-driven file expansion, **not a semantic call graph or automatic annotation of arbitrary external dependency crates**. Existing Verus-aware dependencies use real Cargo-Verus ghost metadata/VIR. Ordinary dependencies retain their native build artifacts and may still require models or explicit checking boundaries.
 

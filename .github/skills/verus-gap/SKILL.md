@@ -18,23 +18,23 @@ Locate the supplied tool directory or installed executable. Commands are relativ
 
 Setup creates the Python environment and validates the latest official Verus distribution, matching Rust, vstd and Z3. Register an explicitly requested existing distribution with `./setup --verus PATH`, or pin with `--release VERSION`. Keep the toolchain fixed while investigating or comparing findings.
 
-The default scanner builds an isolated project copy, captures the actual native Cargo context, rechecks syntax-only source preparation with ordinary Rust, smoke-tests compiler support, and probes active files independently. It reproduces candidate support errors before counting them, records explicit body/declaration exclusions, and follows uniquely resolvable local function/type boundaries. SMT verification is off; proof lifetime checking remains on.
+The scanner builds an isolated project copy, captures the actual native Cargo context, rechecks syntax-only source preparation with ordinary Rust, smoke-tests compiler support, and probes active files independently. It reproduces candidate support errors before counting them and records explicit body/declaration exclusions. The default level 2 looks for quick initial findings in the selected code without expanding Verus checking into dependency files. SMT verification is off; proof lifetime checking remains on.
 
 A crate-defined `full` feature is automatically selected unless the user chooses explicit features or no-default-features. Preserve the project's other build options after `--`. A source file or subdirectory inside a crate retains its containing Cargo context; it is not an isolated dependency-free snippet.
 
 Use `--package NAME` only for ambiguous workspaces, `--bin NAME` for a specific binary, or repeat `--file RELATIVE_PATH_OR_GLOB` to bound the scope. Prefer the user's requested scope; do not expand to unrelated repositories.
 
-Choose the exploration policy with `--scan-level {0,1,2}`. Explain the levels as exploration depth, not finding confidence or fixed runtime:
+New scans default to **level 2**; no level option is needed for quick initial findings. Choose a deeper exploration policy with `--scan-level {0,1,2}`. Explain the levels as exploration depth, not finding confidence or fixed runtime:
 
 | Level | User-facing meaning | Scanner policy |
 |---|---|---|
-| `0` (default) | Investigate selected source and needed local dependencies | Follow uniquely resolvable local dependencies and continue isolation |
+| `0` | Investigate selected source and needed local dependencies | Follow uniquely resolvable local dependencies and continue isolation |
 | `1` | Keep looking for more gaps in the selected code | No dependency checking expansion; continue local body/declaration isolation |
-| `2` / `--fast` | Get quick initial findings from the selected code | No dependency checking expansion; stop before further isolation when only checking-boundary errors remain |
+| `2` (default) | Get quick initial findings from the selected code | No dependency checking expansion; stop before further isolation when only checking-boundary errors remain |
 
 All levels retain native Cargo context, preparation controls and repeated confirmation of new support observations. Levels 1 and 2 require grouped primary locations in selected files; unchanged raw context diagnostics remain available. Do not promise identical findings across levels.
 
-A checking boundary means a referenced type, function, or trait is currently outside Verus checking or has been explicitly excluded. It can occur inside the selected file, not just in dependencies, and is not automatically a language or library-model gap. If encountered, it keeps the focused frontier partial even after exclusions. Level 2 stops only when all remaining error diagnostics, excluding compiler summaries, are checking boundaries and no setup/instrumentation blocker is present. Its `checking_boundary_only` stop deliberately leaves those errors unresolved and can hide additional selected-source gaps. Report this limit explicitly rather than calling the scan complete. Resume inherits the recorded level and reuses a deliberately finished boundary-only frontier without another probe; start a new scan to change levels. Conflicting `--fast` and numeric-level options are rejected.
+A checking boundary means a referenced type, function, or trait is currently outside Verus checking or has been explicitly excluded. It can occur inside the selected file, not just in dependencies, and is not automatically a language or library-model gap. If encountered, it keeps the focused frontier partial even after exclusions. Level 2 stops only when all remaining error diagnostics, excluding compiler summaries, are checking boundaries and no setup/instrumentation blocker is present. Its `checking_boundary_only` stop deliberately leaves those errors unresolved and can hide additional selected-source gaps. Report this limit explicitly rather than calling the scan complete. Resume inherits the recorded level, not the new-scan default, and reuses a deliberately finished boundary-only frontier without another probe; start a new scan to change levels.
 
 Use `--verbose` with any level when live progress is useful. It flushes round/confirmation/action updates and newly confirmed groups with original errors and locations. Repeated groups are deduplicated, level-1/2 findings stay in selected source, and unconfirmed/setup/compiler diagnostics are not labeled limitations. Verbosity adds no compiler calls and may be changed on resume; still read the final reports and raw evidence.
 

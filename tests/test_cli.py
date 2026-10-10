@@ -19,10 +19,10 @@ from verus_gap.project import scan_level_from
 
 
 class ScanLevelTests(unittest.TestCase):
-    def test_default_numeric_levels_and_fast_alias_reach_the_same_engine_option(self):
+    def test_default_and_explicit_numeric_levels_reach_the_engine(self):
         cases = [
-            ([], 0), (["--scan-level", "0"], 0), (["--scan-level", "1"], 1),
-            (["--scan-level=2"], 2), (["--fast"], 2), (["--fast", "--scan-level", "2"], 2),
+            ([], 2), (["--scan-level", "0"], 0), (["--scan-level", "1"], 1),
+            (["--scan-level=2"], 2),
         ]
         for options, expected in cases:
             with self.subTest(options=options), tempfile.TemporaryDirectory() as temporary:
@@ -49,10 +49,9 @@ class ScanLevelTests(unittest.TestCase):
                 self.assertEqual(probing_mock.call_args.kwargs["scan_level"], expected)
                 self.assertEqual(project.manifest["scan_level"], expected)
 
-    def test_invalid_or_conflicting_levels_fail_before_setup(self):
+    def test_invalid_levels_fail_before_setup(self):
         cases = [
             ["--scan-level", "-1"], ["--scan-level", "3"], ["--scan-level", "quick"],
-            ["--fast", "--scan-level", "0"], ["--scan-level", "1", "--fast"],
         ]
         for options in cases:
             with self.subTest(options=options), mock.patch("verus_gap.cli.prepare") as preparing:
@@ -61,8 +60,28 @@ class ScanLevelTests(unittest.TestCase):
                 self.assertEqual(failure.exception.code, 2)
                 preparing.assert_not_called()
 
+    def test_fast_is_not_a_scanner_option(self):
+        for options in (["--fast"], ["--fast", "--scan-level", "2"]):
+            with self.subTest(options=options), mock.patch("verus_gap.cli.prepare") as preparing:
+                with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as failure:
+                    main(options)
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn("unrecognized arguments: --fast", errors.getvalue())
+                preparing.assert_not_called()
+
+    def test_help_describes_the_new_scan_default_without_a_fast_alias(self):
+        with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as finished:
+            main(["--help"])
+        self.assertEqual(finished.exception.code, 0)
+        text = " ".join(output.getvalue().split())
+        self.assertIn("--scan-level {0,1,2}", text)
+        self.assertIn("2: selected source", text)
+        self.assertIn("default for new scans", text)
+        self.assertIn("resume inherits its level", text)
+        self.assertNotIn("--fast", text)
+
     def test_scanner_levels_cannot_be_combined_with_legacy_frontier(self):
-        for options in (["--scan-level", "0"], ["--scan-level=2"], ["--fast"]):
+        for options in (["--scan-level", "0"], ["--scan-level=2"]):
             with self.subTest(options=options), redirect_stderr(io.StringIO()) as output:
                 status = main(["--frontier", *options])
             self.assertEqual(status, 2)
@@ -93,7 +112,7 @@ class ScanLevelTests(unittest.TestCase):
             project_path.write_text(json.dumps({"scan_level": 1, "scan_mode": "fast"}))
             report_path.write_text("original evidence")
             before = project_path.read_bytes()
-            for options in (["--fast"], ["--scan-level", "2"], ["--scan-level", "0"]):
+            for options in (["--scan-level", "2"], ["--scan-level", "0"]):
                 with self.subTest(options=options), mock.patch("verus_gap.cli.resume") as resuming:
                     with redirect_stderr(io.StringIO()) as errors:
                         status = main(["--resume", str(output), *options])
@@ -102,6 +121,41 @@ class ScanLevelTests(unittest.TestCase):
                     resuming.assert_not_called()
                     self.assertEqual(project_path.read_bytes(), before)
                     self.assertEqual(report_path.read_text(), "original evidence")
+
+    def test_resume_without_a_level_inherits_the_saved_policy_instead_of_the_new_default(self):
+        cases = [
+            ({}, 0), ({"scan_mode": "fast"}, 1),
+            ({"scan_level": 0}, 0), ({"scan_level": 1}, 1), ({"scan_level": 2}, 2),
+        ]
+        for saved, expected in cases:
+            with self.subTest(saved=saved), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                (output / "project.json").write_text(json.dumps(saved))
+                project = SimpleNamespace(
+                    manifest={"tool_sha256": {}, **saved}, sources={"lib.rs": SimpleNamespace()},
+                    deadline=time.monotonic() + 30, save=mock.Mock(), verify_originals=mock.Mock(),
+                    output=output,
+                )
+
+                def probing(project, focus, directory, *, scan_level, progress):
+                    directory.mkdir(parents=True)
+                    return {"status": "frontend_clear", "stop_reason": "no_remaining_errors"}
+
+                report = {
+                    "counts": {}, "status": "no_confirmed_limitations",
+                    "coverage": {"pending_files": 0, "partial_files": 0},
+                }
+                with mock.patch("verus_gap.cli.resume", return_value=project) as resuming, mock.patch(
+                    "verus_gap.cli.prepare",
+                ) as preparing, mock.patch("verus_gap.cli.probe", side_effect=probing) as probing_mock, mock.patch(
+                    "verus_gap.cli.save_report", return_value=report,
+                ), redirect_stdout(io.StringIO()):
+                    status = main(["--resume", str(output)])
+                self.assertEqual(status, 0)
+                resuming.assert_called_once()
+                preparing.assert_not_called()
+                self.assertEqual(probing_mock.call_args.kwargs["scan_level"], expected)
+                self.assertEqual(project.manifest["scan_level"], expected)
 
     def test_invalid_saved_level_does_not_overwrite_existing_reports(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -188,7 +242,7 @@ class VerboseProgressTests(unittest.TestCase):
         self.assertNotIn("[dependency]", text)
         self.assertEqual(records, original)
 
-    def test_default_output_labels_dependency_and_later_selected_locations(self):
+    def test_level_0_output_labels_dependency_and_later_selected_locations(self):
         progress = VerboseProgress(["selected.rs"], fast=False)
         output = io.StringIO()
         with redirect_stdout(output):
