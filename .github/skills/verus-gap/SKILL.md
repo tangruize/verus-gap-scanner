@@ -5,7 +5,7 @@ description: Diagnose selected Verus gaps and crashes, distinguish scanner false
 
 # Diagnose Verus limitations
 
-Select the user's API, construct, source location, diagnostic, or crash and establish the goal: explanation, workaround, specification, or Verus repair. Ask for a target if unclear; generated per-file setup tasks do not choose it. For scanning, follow the supplied tool's `README.md`; its paths are relative to the tool, not a copied skill. Reuse saved results. Inventory-only requests can stop at `report.md`.
+Select the user's API, construct, source location, diagnostic, or crash and establish the goal: explanation, workaround, specification, or Verus repair. Ask for a target if unclear; generated per-file setup tasks do not choose it. For normal scanning, follow the supplied tool's `README.md`; consult only relevant sections of `doc/REFERENCE.md` for advanced options. These paths are relative to the tool, not a copied skill. Reuse saved results. Inventory-only requests can stop at `report.md`.
 
 Work in an authorized investigation copy and preserve originals, toolchain/dependency identities, and raw evidence. Use trusted inputs because build scripts and procedural macros execute. Ask before production changes, behavioral/trust changes, substantial extra work, or publication.
 
@@ -28,7 +28,7 @@ Keep the diagnosis unresolved when required controls are missing. Warnings alone
 
 ## Repair missing build context with a configuration
 
-When default setup fails, first distinguish Cargo metadata, unchanged-Rust compilation, preparation, and target/support setup failures. Read the actual failing command and complete output; do not try to cure an unsupported Rust/Verus construct with build flags. Configuration syntax, selection, and commands are in README's optional build configuration section.
+When default setup fails, first distinguish Cargo metadata, unchanged-Rust compilation, preparation, and target/support setup failures. Read the actual failing command and complete output; do not try to cure an unsupported Rust/Verus construct with build flags. Configuration syntax, selection, and commands are in [the command reference](../../../doc/REFERENCE.md#optional-build-configuration).
 
 1. Recover the project's documented native build recipe from its README, `.cargo/config.toml`, manifests, Makefile/CI commands, target JSON, and relevant build scripts. Identify the intended package, target, features, Rust flags, environment, and generated assets. Do not assume host compilation, enable `full` automatically, or choose arbitrary platform/memory defaults.
 2. Reproduce that recipe in an authorized copy with Verus's matching Rust. Separate missing configuration from toolchain incompatibility, missing system tools/assets, and actual source errors. A configuration only supplies build settings; it must not install tools, execute setup scripts, or weaken checks.

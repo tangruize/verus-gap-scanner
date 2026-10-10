@@ -2,7 +2,8 @@
 
 | Read | For |
 |---|---|
-| [README.md](README.md) | Installation and all command/parameter usage. The quick start is sufficient for normal scans; consult optional sections only as needed. |
+| [README.md](README.md) | Installation and normal scanning, with brief optional-feature navigation. |
+| [Command reference](doc/REFERENCE.md) | Detailed commands, configuration format, scope, evidence, and replay. Read only the relevant section when needed. |
 | [Verus Gap skill](.github/skills/verus-gap/SKILL.md) | Diagnose user-selected limitations or crashes: false positives, root causes, tested fixes, and upstream contributions. |
 | [Validation notes](doc/VALIDATION.md) | Detailed measurements and audit methodology, only when those are requested. |
 
