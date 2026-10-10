@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
+from functools import cached_property
 
 from tree_sitter import Language, Node, Parser
 import tree_sitter_rust
@@ -166,34 +167,56 @@ class Rendered:
     def checked(self, byte: int) -> bool:
         return any(start <= byte < end for start, end in (self.checking_ranges or []))
 
+    @cached_property
+    def _segment_starts(self) -> tuple[int, ...]:
+        return tuple(segment.start for segment in self.segments)
+
+    @cached_property
+    def _line_starts(self) -> tuple[int, ...]:
+        return (0, *(match.end() for match in re.finditer(b"\n", self.original)))
+
+    @cached_property
+    def _lines(self) -> list[str]:
+        return self.original.decode("utf-8").splitlines()
+
     def location(self, byte: int) -> dict | None:
-        starts = [segment.start for segment in self.segments]
-        index = bisect.bisect_right(starts, byte) - 1
+        index = bisect.bisect_right(self._segment_starts, byte) - 1
         if index < 0:
             return None
         segment = self.segments[index]
         if byte >= segment.end or segment.original is None:
             return None
         original = segment.original if segment.anchored else segment.original + byte - segment.start
-        prefix = self.original[:original]
-        line = prefix.count(b"\n") + 1
-        column = len(prefix.rsplit(b"\n", 1)[-1].decode("utf-8", "replace")) + 1
-        lines = self.original.decode("utf-8").splitlines()
+        line = bisect.bisect_right(self._line_starts, original)
+        column = len(self.original[self._line_starts[line - 1]:original].decode("utf-8", "replace")) + 1
         return {
             "file": self.file, "line": line, "column": column,
-            "byte": original, "source": lines[line - 1] if line <= len(lines) else "",
+            "byte": original, "source": self._lines[line - 1] if line <= len(self._lines) else "",
         }
 
     def patch(self) -> str:
+        return self._patch
+
+    @cached_property
+    def _patch(self) -> str:
         return "".join(difflib.unified_diff(
             self.original.decode("utf-8").splitlines(keepends=True),
             self.data.decode("utf-8").splitlines(keepends=True),
             fromfile="original/" + self.file, tofile="scan/" + self.file,
         ))
 
-    @property
+    @cached_property
     def sha256(self) -> str:
         return hashlib.sha256(self.data).hexdigest()
+
+    @cached_property
+    def overlay(self) -> dict:
+        return {
+            "sha256": self.sha256,
+            "edits": [asdict(edit) for edit in self.edits],
+            "segments": [asdict(segment) for segment in self.segments],
+            "checking_ranges": self.checking_ranges,
+        }
 
 
 def apply_edits(original: bytes, file: str, edits: list[Edit]) -> Rendered:
@@ -232,6 +255,8 @@ class Source:
         self.parse_errors: list[dict] = []
         self._collect(self.tree.root_node)
         self._prepare(self.tree.root_node)
+        self._render_key: tuple | None = None
+        self._rendered: Rendered | None = None
 
     def _text(self, node: Node | None) -> str:
         return self.data[node.start_byte:node.end_byte].decode("utf-8") if node else ""
@@ -463,6 +488,21 @@ class Source:
                prepare: bool = True, wrap: bool = True,
                unwrapped: set[str] | None = None, load_support: bool = False,
                support_crate: str = "vstd") -> Rendered:
+        key = (
+            frozenset(bodies), frozenset(excluded), prepare, wrap,
+            frozenset(unwrapped or ()), load_support, support_crate,
+        )
+        if key != self._render_key or self._rendered is None:
+            self._rendered = self._render(
+                bodies, excluded, prepare, wrap, unwrapped, load_support, support_crate,
+            )
+            self._render_key = key
+        return self._rendered
+
+    def _render(self, bodies: set[str], excluded: set[str],
+                prepare: bool, wrap: bool,
+                unwrapped: set[str] | None, load_support: bool,
+                support_crate: str) -> Rendered:
         edits = list(self.preparation) if prepare else []
         if not wrap and not load_support and not bodies and not excluded:
             return apply_edits(self.data, self.file, edits)

@@ -13,7 +13,96 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from verus_gap.engine import State, canonical, classify, compiler_panic, parse_output, probe
+from verus_gap.engine import DependencyIndex, State, canonical, classify, compiler_panic, dependencies, parse_output, probe
+from verus_gap.source import Cfg, Source
+
+
+class PerformanceTests(unittest.TestCase):
+    def support(self, byte: int = 0):
+        return {
+            "category": "language_rejection", "level": "error",
+            "message": "Verus does not support example",
+            "locations": [{"file": "lib.rs", "byte": byte}], "related_locations": [],
+        }
+
+    def run_rounds(self, outputs: list[list[dict]], rounds: int):
+        result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+        project = SimpleNamespace(
+            manifest={"tool_sha256": {}}, sources={}, deadline=time.monotonic() + 30,
+            verify_originals=mock.Mock(),
+        )
+
+        def advance(project, state, records, number):
+            state.bodies.setdefault("lib.rs", set()).add(str(number))
+            return True
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "verus_gap.engine.execute", side_effect=[(result, records, "") for records in outputs],
+        ) as execute, mock.patch("verus_gap.engine.refine", side_effect=advance):
+            report = probe(project, "lib.rs", Path(directory), max_rounds=rounds, expand_scope=False)
+        return report, execute.call_count
+
+    def test_already_accepted_diagnostic_does_not_reconfirm_another_overlay(self):
+        support = self.support()
+        report, calls = self.run_rounds([[support], [support], [support]], 2)
+        self.assertEqual(calls, 3)
+        self.assertTrue(report["observations"][0]["confirmed"])
+        self.assertEqual(report["observations"][0]["round"], 0)
+        self.assertEqual(report["observations"][0]["evidence"], "round-000/verus.txt")
+        self.assertTrue(report["rounds"][0]["confirmation_performed"])
+        self.assertFalse(report["rounds"][1]["confirmation_performed"])
+        self.assertEqual(report["rounds"][1]["previously_confirmed_support"], 1)
+        self.assertEqual(len(report["observations"]), 1)
+
+    def test_same_diagnostic_at_a_new_location_still_requires_confirmation(self):
+        first, second = self.support(), self.support(1)
+        report, calls = self.run_rounds([[first], [first], [first, second], [first, second]], 2)
+        self.assertEqual(calls, 4)
+        self.assertTrue(all(record["confirmed"] for record in report["observations"]))
+        self.assertTrue(report["rounds"][1]["confirmation_performed"])
+        self.assertEqual(report["observations"][1]["round"], 1)
+
+    def test_unconfirmed_observation_never_suppresses_a_later_confirmation(self):
+        support = self.support()
+        report, calls = self.run_rounds([[support], [], [support], [support]], 2)
+        self.assertEqual(calls, 4)
+        self.assertTrue(report["rounds"][1]["confirmation_performed"])
+        self.assertEqual(report["rounds"][1]["previously_confirmed_support"], 0)
+        self.assertFalse(report["observations"][0]["confirmed"])
+
+    def test_dependency_index_preserves_priority_scope_and_ambiguity(self):
+        sources = {
+            "src/lib.rs": "mod a; mod b;\n",
+            "src/a.rs": "pub fn value() {} pub struct Value;\n",
+            "src/b.rs": "pub fn value() {} pub struct Value;\n",
+            "outside.rs": "pub fn other() {}\n",
+        }
+        project = SimpleNamespace(
+            sources={name: Source(name, text.encode(), Cfg([])) for name, text in sources.items()},
+            manifest={"crate_name": "fixture", "root_source": "src/lib.rs"},
+        )
+        index = DependencyIndex(project)
+
+        def resolve(path, scope=(), kind="function"):
+            record = {"category": "checking_boundary", "message": f"cannot use {kind} `fixture::{path}`"}
+            return dependencies(project, State(list(scope)), [record], index)
+
+        self.assertEqual(resolve("a::value"), ["src/a.rs"])
+        self.assertEqual(resolve("value"), [])
+        self.assertEqual(resolve("value", ["src/a.rs"]), ["src/b.rs"])
+        self.assertEqual(resolve("a::value", ["src/a.rs"]), ["src/b.rs"])
+        self.assertEqual(resolve("a::GENERATED"), ["src/a.rs"])
+        self.assertEqual(resolve("a::Value", kind="type"), ["src/a.rs"])
+        self.assertEqual(resolve("unknown::other"), ["outside.rs"])
+        self.assertEqual(resolve("value", ["src/a.rs", "src/b.rs"]), [])
+
+    def test_dependency_index_does_not_resolve_inactive_declarations(self):
+        project = SimpleNamespace(
+            sources={"src/a.rs": Source("src/a.rs", b"#[cfg(windows)] pub fn gone() {}\n", Cfg([]))},
+            manifest={"crate_name": "fixture", "root_source": "src/lib.rs"},
+        )
+        record = {"category": "checking_boundary", "message": "cannot use function `fixture::unknown::gone`"}
+        self.assertEqual(dependencies(project, State([]), [record], DependencyIndex(project)), [])
 
 
 class ClassificationTests(unittest.TestCase):

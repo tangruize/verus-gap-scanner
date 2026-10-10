@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .gap import GapError, run, save_run
@@ -269,8 +269,8 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
                 load_support=name == project.manifest["root_source"],
                 support_crate=project.manifest.get("support_crate_name", "vstd"),
             )
-            path = project.workspace / name
-            maps[str(path.resolve())] = mapped
+            path = project.source_paths[name]
+            maps[str(path)] = mapped
             if mapped.data != source.data:
                 path.write_bytes(mapped.data)
                 modified.append(name)
@@ -281,10 +281,7 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
             mapping.patch() for mapping in maps.values() if mapping.file in modified
         ))
         write_json(directory / "overlay.json", {
-            name: {"sha256": maps[str((project.workspace / name).resolve())].sha256,
-                   "edits": [asdict(edit) for edit in maps[str((project.workspace / name).resolve())].edits],
-                   "segments": [asdict(segment) for segment in maps[str((project.workspace / name).resolve())].segments],
-                   "checking_ranges": maps[str((project.workspace / name).resolve())].checking_ranges}
+            name: maps[str(project.source_paths[name])].overlay
             for name in modified
         })
         command = list(project.command)
@@ -377,46 +374,62 @@ def refine(project: Project, state: State, records: list[dict], round_number: in
     return added
 
 
-def dependencies(project: Project, state: State, records: list[dict]) -> list[str]:
+class DependencyIndex:
+    def __init__(self, project: Project):
+        self.exact: dict[tuple[str, tuple[str, ...]], set[str]] = {}
+        self.suffix: dict[tuple[str, tuple[str, ...]], set[str]] = {}
+        self.modules: dict[tuple[str, ...], set[str]] = {}
+        src_root = Path(project.manifest["root_source"]).parent
+        for name, source in project.sources.items():
+            file = Path(name)
+            if file.is_relative_to(src_root):
+                relative = file.relative_to(src_root)
+                module = relative.parts[:-1]
+                if file.stem not in {"lib", "main", "mod"}:
+                    module += (file.stem,)
+            else:
+                module = ()
+            if module:
+                self.modules.setdefault(module, set()).add(name)
+            for declaration in source.declarations:
+                if not declaration.enabled:
+                    continue
+                if declaration.kind == "function_item":
+                    kind = "function"
+                elif declaration.kind in {
+                    "struct_item", "enum_item", "union_item", "type_item", "trait_item",
+                }:
+                    kind = "type"
+                else:
+                    continue
+                declared = tuple(re.sub(r"<[^<>]*>", "", declaration.name).split("::"))
+                self.exact.setdefault((kind, module + declared), set()).add(name)
+                self.suffix.setdefault((kind, declared), set()).add(name)
+
+    def candidates(self, kind: str, parts: tuple[str, ...], scope: set[str]) -> set[str]:
+        exact = self.exact.get((kind, parts), set()) - scope
+        if exact:
+            return exact
+        matches = set().union(*(
+            self.suffix.get((kind, parts[index:]), set()) for index in range(len(parts))
+        )) - scope
+        return matches or self.modules.get(parts[:-1], set()) - scope
+
+
+def dependencies(project: Project, state: State, records: list[dict],
+                 index: DependencyIndex | None = None) -> list[str]:
     crate = project.manifest["crate_name"]
     found = set()
-    src_root = Path(project.manifest["root_source"]).parent
+    scope = set(state.scope)
     for record in records:
         if record["category"] != "checking_boundary":
             continue
         match = re.search(r"cannot use (function|type) `([^`]+)`", record["message"])
         if not match or not match[2].startswith(crate + "::"):
             continue
-        parts = match[2].split("::")[1:]
-        matches, exact, modules = set(), set(), set()
-        for name, source in project.sources.items():
-            if name in state.scope:
-                continue
-            file = Path(name)
-            if file.is_relative_to(src_root):
-                relative = file.relative_to(src_root)
-                module = list(relative.parts[:-1])
-                if file.stem not in {"lib", "main", "mod"}:
-                    module.append(file.stem)
-            else:
-                module = []
-            if module and parts[:-1] == module:
-                modules.add(name)
-            for declaration in source.declarations:
-                if not declaration.enabled:
-                    continue
-                declared = re.sub(r"<[^<>]*>", "", declaration.name).split("::")
-                if match[1] == "function" and declaration.kind != "function_item":
-                    continue
-                if match[1] == "type" and declaration.kind not in {
-                    "struct_item", "enum_item", "union_item", "type_item", "trait_item",
-                }:
-                    continue
-                if module + declared == parts:
-                    exact.add(name)
-                elif len(parts) >= len(declared) and parts[-len(declared):] == declared:
-                    matches.add(name)
-        candidates = exact or matches or modules
+        if index is None:
+            index = DependencyIndex(project)
+        candidates = index.candidates(match[1], tuple(match[2].split("::")[1:]), scope)
         if len(candidates) == 1:
             found.update(candidates)
     return sorted(found)
@@ -447,6 +460,11 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                     getattr(state, field_name).setdefault(event["file"], set()).add(event["id"])
     summary["scanner_revision"] = revision
     seen = {record_key(record) for record in summary["observations"]}
+    accepted = {
+        record_key(record) for record in summary["observations"]
+        if record["confirmed"] and record["category"] in {"language_rejection", "library_specification"}
+    }
+    dependency_index = None
     states = {record["state"] for record in summary["rounds"][:-1]}
     start = len(summary["rounds"])
     budget = max_rounds if max_rounds is not None else 4 + 3 * sum(
@@ -476,7 +494,8 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 and not any(item["category"] == "instrumentation_failure" for item in records)
             ]
             confirmed = set()
-            if candidates or panic:
+            new_candidates = [record for record in candidates if record_key(record) not in accepted]
+            if new_candidates or panic:
                 second, repeated, _ = execute(project, state, directory / "confirmation", per_run)
                 repeated_panic = compiler_panic(second, project, state)
                 if panic and repeated_panic and not second["timed_out"]:
@@ -496,6 +515,10 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                         scope=list(state.scope), confirmed=key in confirmed,
                         source_variant="prepared" if not state.events else "isolated",
                     ))
+                    if key in confirmed and record["category"] in {
+                        "language_rejection", "library_specification",
+                    }:
+                        accepted.add(key)
             blockers = sorted({
                 record["category"] for record in records
                 if (record["level"] == "error" or record["category"] == "instrumentation_failure")
@@ -508,6 +531,8 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 "seconds": result["seconds"], "records": len(records), "blockers": blockers,
                 "evidence": f"round-{number:03d}/verus.txt",
                 "state": fingerprint, "confirmed": len(confirmed),
+                "confirmation_performed": bool(new_candidates or panic),
+                "previously_confirmed_support": len(candidates) - len(new_candidates),
             })
             summary["events"] = list(state.events)
             summary["scope"] = list(state.scope)
@@ -528,7 +553,11 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 summary["status"] = "frontier_cleared_after_exclusions" if exclusions else "frontend_clear"
                 summary["stop_reason"] = "no_remaining_errors"
                 break
-            additions = dependencies(project, state, records) if expand_scope else []
+            if expand_scope and dependency_index is None and any(
+                record["category"] == "checking_boundary" for record in records
+            ):
+                dependency_index = DependencyIndex(project)
+            additions = dependencies(project, state, records, dependency_index) if expand_scope else []
             if not additions and expand_scope:
                 additions = sorted({
                     place["file"] for record in records

@@ -8,6 +8,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 from .gap import (
@@ -34,6 +35,10 @@ class Project:
     sources: dict[str, Source]
     manifest: dict
     deadline: float
+
+    @cached_property
+    def source_paths(self) -> dict[str, Path]:
+        return {name: (self.workspace / name).resolve() for name in self.sources}
 
     def save(self):
         write_json(self.output / "project.json", self.manifest)

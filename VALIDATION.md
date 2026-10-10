@@ -8,6 +8,14 @@ The complete **114-test suite passed from a fresh extracted source package**, in
 
 The supported example exits 0 without accepted gaps. The intentional demo exits 1 with two observed `Instant` type/API model groups. Exit 1 is an expected diagnostic result, not an installation failure. Neither result is a correctness proof.
 
+## Conservative performance changes
+
+The working-tree scanner adds bounded last-overlay caching, cached diffs and byte/line indexes, and preindexed local dependency resolution. Cache keys include every rendering option and all body/declaration/context exclusions. Dependency resolution retains the previous exact-name, suffix, module-fallback and ambiguity rules, including removal of already checked files before resolving.
+
+Confirmation is skipped only when every current support candidate already has an accepted observation with retained original evidence. It never treats another overlay as a confirmation of a new observation, never skips confirmation for an unconfirmed diagnostic, and still distinguishes the same message at different source positions. Compiler failures retain their repeated-run policy. These changes leave scope expansion and isolation order unchanged; the previously published 0.2.0 archives and project reports remain frozen.
+
+The complete updated suite passes **122 tests**, including real Cargo/Verus controls. Same-input Uluru checks retain all eight model groups, the same 24 exploration rounds and the same exclusions; this small single-file crate has essentially unchanged runtime.
+
 ## Controls against misleading findings
 
 Every production input first passed its unchanged native Rust build and an ordinary-Rust syntax-preparation recheck. Compiler support was smoke-tested before application diagnostics were interpreted. Accepted support observations were audited against a second run with identical source overlays and compiler context, original source locations, raw diagnostic text, compiler/support/dependency hashes, and restored copied sources. Production sources were not edited.

@@ -33,6 +33,8 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 
 Resume validates source/compiler/dependency identities, reuses the baseline and completed shards, and continues partial frontiers. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour). No per-function agent calls are needed.
 
+The scanner caches unchanged source overlays, diffs and source-location indexes, and indexes local dependency names once per frontier. These optimizations do not change the checking scope or isolation order. An already accepted observation keeps its original two-run evidence; seeing it again does not trigger another confirmation unless the round contains a new or still-unconfirmed support observation. New observations and compiler failures still require same-overlay confirmation, and all raw runs and patches are retained.
+
 Use trusted projects: Cargo build scripts and procedural macros execute in the copied workspace.
 
 ## Read the result

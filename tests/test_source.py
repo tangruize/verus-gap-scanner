@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import sys
 import unittest
 from pathlib import Path
@@ -11,6 +12,64 @@ from verus_gap.source import Cfg, Edit, Source, apply_edits
 
 
 class SourceTests(unittest.TestCase):
+    def test_render_cache_reuses_only_the_same_complete_overlay(self):
+        original = b"pub fn f() { let _ = 1; }\n"
+        source = Source("lib.rs", original, Cfg([]))
+        function = source.functions[0]
+        first = source.render(set(), set())
+        self.assertIs(source.render(set(), set()), first)
+        bodies = {function.id}
+        isolated = source.render(bodies, set())
+        self.assertIsNot(isolated, first)
+        self.assertIs(source.render(set(bodies), set()), isolated)
+        self.assertEqual(isolated.overlay["checking_ranges"], isolated.checking_ranges)
+        self.assertTrue(first.checked(original.index(b"let")))
+        self.assertFalse(isolated.checked(original.index(b"let")))
+        bodies.clear()
+        restored = source.render(bodies, set())
+        self.assertEqual(restored.data, first.data)
+        self.assertEqual(restored.overlay, first.overlay)
+        external = source.render(set(), {function.id})
+        self.assertFalse(external.checked(original.index(b"pub fn")))
+        ordinary = source.render(set(), set(), wrap=False, prepare=False)
+        self.assertEqual(ordinary.data, original)
+        supported = source.render(set(), set(), load_support=True, support_crate="support")
+        self.assertIn(b"support::prelude::verus!", supported.data)
+        unwrapped = source.render(set(), set(), unwrapped={function.id})
+        self.assertFalse(unwrapped.checked(original.index(b"pub fn")))
+
+    def test_rendered_patch_is_cached_without_changing_the_diff(self):
+        source = Source("lib.rs", b"pub fn f() {}\n", Cfg([]))
+        rendered = source.render(set(), set())
+        with mock.patch("verus_gap.source.difflib.unified_diff", wraps=difflib.unified_diff) as diff:
+            first = rendered.patch()
+            self.assertEqual(rendered.patch(), first)
+            diff.assert_called_once()
+        self.assertIn("--- original/lib.rs", first)
+        self.assertIn("+++ scan/lib.rs", first)
+
+    def test_indexed_locations_match_original_byte_mapping(self):
+        original = "// λ\r\npub fn f() { let café = 1; }\n".encode()
+        rendered = apply_edits(original, "lib.rs", [
+            Edit(0, 0, "// added\n", "prefix"),
+            Edit(original.index(b"1"), original.index(b"1") + 1, "10", "anchored", anchor=original.index(b"1")),
+        ])
+        for segment in rendered.segments:
+            for byte in range(segment.start, segment.end):
+                place = rendered.location(byte)
+                if segment.original is None:
+                    self.assertIsNone(place)
+                    continue
+                offset = segment.original if segment.anchored else segment.original + byte - segment.start
+                prefix = original[:offset]
+                lines = original.decode().splitlines()
+                line = prefix.count(b"\n") + 1
+                self.assertEqual(place, {
+                    "file": "lib.rs", "line": line,
+                    "column": len(prefix.rsplit(b"\n", 1)[-1].decode("utf-8", "replace")) + 1,
+                    "byte": offset, "source": lines[line - 1] if line <= len(lines) else "",
+                })
+
     def test_ordinary_unchanged_context_does_not_walk_declarations(self):
         original = b"pub fn f() {}\n"
         source = Source("lib.rs", original, Cfg([]))
