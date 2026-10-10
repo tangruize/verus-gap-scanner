@@ -20,6 +20,9 @@ from .report import save_report
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     if "--frontier" in values:
+        if "--fast" in values:
+            print("error: --fast is an adaptive scan mode; do not combine it with --frontier.", file=sys.stderr)
+            return 2
         values.remove("--frontier")
         from .gap import main as frontier
         return frontier(values)
@@ -35,6 +38,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--package", help="crate name when the workspace is ambiguous")
     parser.add_argument("--bin", help="binary target when there is no unique library")
     parser.add_argument("--file", action="append", default=[], help="file or glob relative to workspace or crate")
+    parser.add_argument("--fast", action="store_true",
+                        help="explore and report selected source only, without recursive checking expansion")
     parser.add_argument("--out", help="new result directory")
     parser.add_argument("--resume", help="continue a result directory without rebuilding dependencies")
     parser.add_argument("--verus", help="existing complete Verus distribution")
@@ -59,7 +64,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     project = None
     try:
+        if args.resume:
+            previous = json.loads((output / "project.json").read_text())
+            previous_mode = previous.get("scan_mode", "adaptive")
+            if previous_mode not in {"adaptive", "fast"}:
+                print(f"error: Unknown saved scan mode: {previous_mode}", file=sys.stderr)
+                return 2
+            if args.fast and previous_mode != "fast":
+                print("error: A resumed scan keeps its original mode; start a new --fast scan.", file=sys.stderr)
+                return 2
         project = resume(output, args.timeout) if args.resume else prepare(args, cargo, output)
+        mode = project.manifest.get("scan_mode", "adaptive") if args.resume else (
+            "fast" if args.fast else "adaptive"
+        )
+        project.manifest["scan_mode"] = mode
         selected = list(project.sources)
         if args.resume and not args.file and project.manifest.get("selected_files"):
             selected = project.manifest["selected_files"]
@@ -88,16 +106,20 @@ def main(argv: list[str] | None = None) -> int:
             cached_path = output / saved if saved else base
             if args.resume and (cached_path / "report.json").is_file():
                 cached = json.loads((cached_path / "report.json").read_text())
-                if cached.get("scanner_revision") == revision and cached["status"] != "partial":
+                same_scan = (
+                    cached.get("scanner_revision") == revision
+                    and cached.get("scan_mode", "adaptive") == mode
+                )
+                if same_scan and cached["status"] != "partial":
                     result, directory = cached, cached_path
-                elif cached.get("scanner_revision") == revision:
+                elif same_scan:
                     directory = cached_path
-                    result = probe(project, name, directory)
+                    result = probe(project, name, directory, expand_scope=mode != "fast")
                 else:
                     directory = base / revision
-                    result = probe(project, name, directory)
+                    result = probe(project, name, directory, expand_scope=mode != "fast")
             else:
-                result = probe(project, name, directory)
+                result = probe(project, name, directory, expand_scope=mode != "fast")
             result["scanner_revision"] = revision
             result["directory"] = str(directory.relative_to(output))
             write_json(directory / "report.json", result)

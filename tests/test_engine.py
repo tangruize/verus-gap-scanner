@@ -263,6 +263,106 @@ class RealInventoryTests(unittest.TestCase):
         self.assertFalse((project / "target").exists())
         return process, output
 
+    def test_fast_file_retains_cargo_context_without_exploring_dependency_bodies(self):
+        files = {
+            "Cargo.toml": (
+                '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n'
+                '[features]\ndefault=["enabled"]\nenabled=[]\n'
+            ),
+            "src/lib.rs": "mod selected;\nmod helper;\nmod unrelated;\n",
+            "src/selected.rs": (
+                "#[cfg(feature=\"enabled\")] pub fn local() { let _ = std::time::Instant::now(); }\n"
+                "pub fn blocked() -> usize { crate::helper::value() }\n"
+            ),
+            "src/helper.rs": "pub fn value() -> usize { let _ = std::time::SystemTime::now(); 1 }\n",
+            "src/unrelated.rs": "pub struct Unrelated; unsafe impl Send for Unrelated {}\n",
+        }
+        process, output = self.scan(files, "--fast", target_relative="src/selected.rs")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        project = json.loads((output / "project.json").read_text())
+        self.assertEqual(report["scan_mode"], "fast")
+        self.assertEqual(project["scan_mode"], "fast")
+        self.assertTrue(project["baseline_passed"])
+        self.assertIn('feature="enabled"', project["rust_cfg"])
+        self.assertEqual(report["coverage"]["selected_files"], 1)
+        self.assertEqual(report["coverage"]["expanded_context_files"], 0)
+        self.assertEqual(report["coverage"]["dependency_boundary_limited_files"], 1)
+        self.assertEqual(report["coverage"]["partial_files"], 1)
+        self.assertEqual(report["selected_scope_counts"], report["counts"])
+        self.assertEqual(report["counts"]["library_specification"], 2)
+        self.assertNotIn("language_rejection", report["counts"])
+        self.assertEqual(report["shards"][0]["scope"], ["src/selected.rs"])
+        self.assertEqual(report["shards"][0]["stop_reason"], "focused_dependency_boundary")
+        for group in report["groups"]:
+            self.assertTrue(all(place["file"] == "src/selected.rs" for place in group["locations"]))
+            if group["category"] == "library_specification":
+                self.assertTrue(group["confirmed"])
+        self.assertNotIn("SystemTime", (output / "report.md").read_text())
+        self.assertIn("selected source only", (output / "report.md").read_text())
+        self.assertFalse(any(event["kind"] == "scope_expansion" for event in report["shards"][0]["events"]))
+
+    def test_fast_resume_inherits_mode_and_retains_existing_evidence(self):
+        process, output = self.scan({"lib.rs": "pub fn good() -> u32 { 1 }\n"}, "--fast")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        evidence = output / report["shards"][0]["directory"] / "round-000/verus.stderr"
+        timestamp = evidence.stat().st_mtime_ns
+        resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(json.loads((output / "report.json").read_text())["scan_mode"], "fast")
+        self.assertEqual(evidence.stat().st_mtime_ns, timestamp)
+
+    def test_fast_directory_checks_all_selected_files_but_no_other_files(self):
+        files = {
+            "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            "src/lib.rs": "mod selected;\nmod unrelated;\n",
+            "src/selected/mod.rs": "mod first;\nmod second;\n",
+            "src/selected/first.rs": "pub fn first() { let _ = std::time::Instant::now(); }\n",
+            "src/selected/second.rs": "pub fn second(value: &mut u32) { let _ = std::mem::replace(value, 2); }\n",
+            "src/unrelated.rs": "pub struct Unrelated; unsafe impl Send for Unrelated {}\n",
+        }
+        process, output = self.scan(files, "--fast", target_relative="src/selected")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["coverage"]["selected_files"], 3)
+        self.assertEqual(report["coverage"]["expanded_context_files"], 0)
+        self.assertEqual(report["counts"]["library_specification"], 3)
+        self.assertNotIn("language_rejection", report["counts"])
+        self.assertTrue(all(shard["scope"] == [shard["focus"]] for shard in report["shards"]))
+
+    def test_adaptive_resume_cannot_be_silently_changed_to_fast(self):
+        process, output = self.scan({"lib.rs": "pub fn good() -> u32 { 1 }\n"})
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        before = {name: (output / name).read_bytes() for name in ("project.json", "report.md", "report.json")}
+        resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output), "--fast"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("keeps its original mode", resumed.stderr)
+        for name, data in before.items():
+            self.assertEqual((output / name).read_bytes(), data)
+
+    def test_fast_boundary_only_scan_does_not_claim_a_clear_frontier(self):
+        files = {
+            "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            "src/lib.rs": "mod selected;\nmod helper;\n",
+            "src/selected.rs": "pub fn run() -> usize { crate::helper::value() }\n",
+            "src/helper.rs": "pub fn value() -> usize { 1 }\n",
+        }
+        process, output = self.scan(files, "--fast", target_relative="src/selected.rs")
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        self.assertNotIn("library_specification", report["counts"])
+        self.assertEqual(report["coverage"]["partial_files"], 1)
+        self.assertEqual(report["coverage"]["frontier_cleared_after_exclusions"], 0)
+        self.assertEqual(report["coverage"]["expanded_context_files"], 0)
+        self.assertEqual(report["shards"][0]["stop_reason"], "focused_dependency_boundary")
+
     def test_recognized_standard_models_do_not_become_missing_library_gaps(self):
         source = (
             "pub fn recognized() -> bool {\n"

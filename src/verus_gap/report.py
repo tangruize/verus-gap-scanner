@@ -61,8 +61,21 @@ def language_family(message: str) -> str:
 def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict:
     groups: dict[tuple, dict] = {}
     selected_set = set(selected)
+    fast = project.manifest.get("scan_mode", "adaptive") == "fast"
+    outside = []
     for shard in shards:
         for record in shard["observations"]:
+            locations = record["locations"]
+            related_locations = record["related_locations"]
+            if fast:
+                locations = [place for place in locations if place["file"] in selected_set]
+                related_locations = [place for place in related_locations if place["file"] in selected_set]
+                if not locations:
+                    outside.append({
+                        "category": record["category"], "focus": shard["focus"],
+                        "evidence": str(Path(shard["directory"]) / record["evidence"]),
+                    })
+                    continue
             category = record["category"]
             if category in {"language_rejection", "library_specification"} and not record["confirmed"]:
                 category = "unconfirmed_support_diagnostic"
@@ -77,8 +90,8 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
                 "api": api,
                 "family": language_family(key[1]) if category == "language_rejection" else None,
             })
-            for field in ("locations", "related_locations"):
-                for place in record[field]:
+            for field, places in (("locations", locations), ("related_locations", related_locations)):
+                for place in places:
                     if place not in group[field]:
                         group[field].append(place)
             evidence = str(Path(shard["directory"]) / record["evidence"])
@@ -115,6 +128,7 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
         "cargo_args": project.manifest["cargo_args"], "complete_inventory": False,
         "checks": project.manifest["checks"],
         "support_mode": project.manifest.get("support_mode"),
+        "scan_mode": project.manifest.get("scan_mode", "adaptive"),
         "preparation_check": project.manifest.get("preparation_check"),
         "dependency_setup": project.manifest.get("dependency_setup"),
         "status": "limitations_observed" if confirmed else "no_confirmed_limitations",
@@ -138,6 +152,10 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
                 name for shard in shards for name in shard["scope"]
             } - set(selected)),
             "unindexed_external_active_sources": len(project.manifest.get("external_active_sources", [])),
+            "dependency_boundary_limited_files": sum(
+                shard.get("dependency_boundary_limited", False) for shard in shards
+            ),
+            "outside_scope_diagnostics": len(outside),
         },
         "counts": dict(counts), "groups": grouped,
         "selected_scope_counts": dict(Counter(
@@ -147,14 +165,19 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
             group["family"] for group in grouped if group["category"] == "language_rejection"
         ).items())),
         "shards": [
-            {key: shard[key] for key in (
-                "focus", "directory", "status", "stop_reason", "scope", "events",
-            )}
+            {
+                **{key: shard[key] for key in (
+                    "focus", "directory", "status", "stop_reason", "scope", "events",
+                )},
+                "scan_mode": shard.get("scan_mode", "adaptive"),
+                "dependency_boundary_limited": shard.get("dependency_boundary_limited", False),
+            }
             for shard in shards
         ],
         "workspace_restored": project.manifest["workspace_restored"],
         "confirmation": "Accepted support gaps reproduced twice with the same source overlay and compiler context.",
         "reporter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "outside_scope_evidence": outside,
     }
     if report["coverage"]["pending_files"]:
         report["status"] = "partial"
@@ -167,6 +190,7 @@ def markdown(report: dict) -> str:
     coverage = report["coverage"]
     language = report["counts"].get("language_rejection", 0)
     library = report["counts"].get("library_specification", 0)
+    fast = report.get("scan_mode") == "fast"
     lines = [
         "# Verus compatibility inventory", "",
         f"**{language} reproducible language/translation rejections and {library} library specification gaps.** "
@@ -176,12 +200,16 @@ def markdown(report: dict) -> str:
         f"**Crate:** `{report['package']}`; **Verus:** `{report['verus']['version']}`.",
         f"**Unchanged Rust build:** {'passed' if report['baseline_passed'] else 'failed'}. "
         f"**Cargo configuration:** `{' '.join(report['cargo_args']) or 'default features'}`.", "",
+        *([
+            "**Mode: fast, selected source only.** The native Cargo context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
+        ] if fast else []),
         "These are observed compatibility gaps, not a proof or exhaustive feature inventory. Counts are distinct diagnostic/API groups, not unique Rust features. Each accepted support diagnostic was reproduced twice in the same recorded checking context. File shards retain the full Rust build context, but local/generated items may remain outside Verus checking; those boundaries are not counted as library gaps. Later passes explicitly exclude rejected bodies or declarations. Raw diagnostics, source snapshots, and every patch are retained.",
         "", "## At a glance", "",
         f"Support groups with a primary location in your selected files: "
         f"**{report['selected_scope_counts'].get('language_rejection', 0)} language/translation, "
-        f"{report['selected_scope_counts'].get('library_specification', 0)} library models**. "
-        "The overall totals also include checked dependency context reached during scope expansion.", "",
+        f"{report['selected_scope_counts'].get('library_specification', 0)} library models**. " +
+        ("No dependency-only findings are included in this focused report." if fast else
+         "The overall totals also include checked dependency context reached during scope expansion."), "",
         "| Language/error family | Diagnostic groups |", "|---|---:|",
         *[f"| {family} | {count} |" for family, count in report["language_families"].items()],
         "", "Library groups below are labeled with public API names when the compiler supplies them. Unstable compiler definition numbers are normalized only for grouping; every raw diagnostic is unchanged.",
@@ -194,6 +222,10 @@ def markdown(report: dict) -> str:
         f"| Files reaching Verus without explicit exclusions | {coverage['frontier_clear_files']} |",
         f"| Files with no remaining errors after explicit exclusions | {coverage['frontier_cleared_after_exclusions']} |",
         f"| Files with unresolved, compiler, or time-budget frontiers | {coverage['partial_files']} |",
+        *([
+            f"| Files limited by deliberately uncrossed checking boundaries | {coverage['dependency_boundary_limited_files']} |",
+            f"| Outside-scope/unattributed diagnostics retained only in raw evidence | {coverage['outside_scope_diagnostics']} |",
+        ] if fast else []),
         f"| Enumerable function declarations (not a count of verified functions) | {coverage['enumerable_functions']} |",
         f"| Explicit body exclusions / declaration exclusions | {coverage['excluded_bodies']} / {coverage['excluded_declarations']} |",
         f"| Macro invocation sites (generated declarations not fully enumerable) | {coverage['macro_sites']} |",
@@ -251,6 +283,11 @@ def markdown(report: dict) -> str:
             f"| `{shard['focus']}` | `{shard['status']}` | `{shard['stop_reason']}` | "
             f"[JSON]({shard['directory']}/report.json) |"
         )
+    if fast and report.get("outside_scope_evidence"):
+        lines.extend(["", "Outside-scope or unattributed diagnostics are not presented as selected-source findings. "
+                      "They can still block exploration; their unchanged output is retained here:", ""])
+        for item in report["outside_scope_evidence"]:
+            lines.append(f"- `{item['category']}`: [raw evidence]({item['evidence']})")
     lines.extend(["", f"**Scan sources restored:** `{report['workspace_restored']}`. Input sources were not edited.", ""])
     return "\n".join(lines)
 

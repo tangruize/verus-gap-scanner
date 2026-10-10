@@ -6,10 +6,49 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from verus_gap.report import aggregate, language_family, public_api
+from verus_gap.report import aggregate, language_family, markdown, public_api
 
 
 class ReportTests(unittest.TestCase):
+    def test_fast_report_filters_primary_and_related_locations_without_editing_raw_evidence(self):
+        source = SimpleNamespace(functions=[], declarations=[])
+        project = SimpleNamespace(sources={"selected.rs": source, "dependency.rs": source}, manifest={
+            "input": "fixture", "package": "fixture", "verus": {"version": "fixture"}, "baseline_passed": True,
+            "cargo_args": [], "checks": {"proof_lifetimes": True}, "workspace_restored": True, "scan_mode": "fast",
+        })
+        selected = {"file": "selected.rs", "byte": 0, "line": 1, "column": 1, "source": "target()"}
+        dependency = dict(selected, file="dependency.rs")
+        record = {
+            "category": "library_specification", "level": "error", "message": "model not recognized",
+            "rendered": "unchanged raw diagnostic", "locations": [selected, dependency],
+            "related_locations": [dependency], "confirmed": True, "macro_expansion": False,
+            "raw_diagnostic": None, "scope": ["selected.rs"], "source_variant": "prepared",
+            "round": 0, "evidence": "round-000/verus.txt",
+        }
+        shard = {
+            "observations": [record, dict(record, message="dependency-only", locations=[dependency])],
+            "events": [], "focus": "selected.rs", "directory": "shards/a", "scope": ["selected.rs"],
+            "status": "partial", "stop_reason": "focused_dependency_boundary",
+            "dependency_boundary_limited": True,
+        }
+        report = aggregate(project, [shard], ["selected.rs"])
+        self.assertEqual(report["scan_mode"], "fast")
+        self.assertEqual(report["counts"], {"library_specification": 1})
+        self.assertEqual(report["selected_scope_counts"], report["counts"])
+        self.assertEqual(report["coverage"]["expanded_context_files"], 0)
+        self.assertEqual(report["coverage"]["dependency_boundary_limited_files"], 1)
+        self.assertEqual(report["coverage"]["outside_scope_diagnostics"], 1)
+        self.assertEqual(report["groups"][0]["locations"], [selected])
+        self.assertEqual(report["groups"][0]["related_locations"], [])
+        self.assertEqual(report["groups"][0]["dependency_locations"], 0)
+        self.assertEqual(report["groups"][0]["raw_example"], record["rendered"])
+        self.assertEqual(record["locations"], [selected, dependency])
+        self.assertEqual(report["outside_scope_evidence"][0]["evidence"], "shards/a/round-000/verus.txt")
+        text = markdown(report)
+        self.assertIn("Mode: fast, selected source only", text)
+        self.assertNotIn("#### dependency-only", text)
+        self.assertNotIn("`dependency.rs:", text)
+
     def test_public_api_ignores_bracketed_const_bounds(self):
         record = {"raw_diagnostic": {"children": [{
             "message": "pub assume_specification<T, impl [const] FnOnce(T) -> bool + [const] Destruct> "

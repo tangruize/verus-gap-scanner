@@ -31,7 +31,18 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 ./verus-gap --resume /path/to/verus-gap-results/RESULT
 ```
 
+For a quicker investigation focused on the selected source, add **`--fast`**:
+
+```bash
+./verus-gap /path/to/tokio/tokio/src/sync/mutex.rs --fast
+./verus-gap /path/to/tokio/tokio --file 'src/sync/*.rs' --fast
+```
+
+Fast mode keeps the same native Cargo context, source-preparation controls and repeated support evidence. It does not recursively add dependency files to Verus checking, and grouped findings require a primary location in your selected files. Local dependencies remain explicit checking boundaries; affected target bodies/declarations can be isolated to expose other target findings, but those exclusions can hide additional gaps. A frontier that encountered an uncrossed dependency boundary stays partial even if its final compiler errors were excluded. Full raw output is retained, including context diagnostics not presented as selected-source findings. Use the default mode when you also want transitive dependency investigation; fast mode is not a promise of identical recall on every project.
+
 Resume validates source/compiler/dependency identities, reuses the baseline and completed shards, and continues partial frontiers. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour). No per-function agent calls are needed.
+
+Resume also keeps the original scan mode; an existing default scan cannot be turned into a fast scan. Start a new output directory to change modes.
 
 The scanner caches unchanged source overlays, diffs and source-location indexes, and indexes local dependency names once per frontier. These optimizations do not change the checking scope or isolation order. An already accepted observation keeps its original two-run evidence; seeing it again does not trigger another confirmation unless the round contains a new or still-unconfirmed support observation. New observations and compiler failures still require same-overlay confirmation, and all raw runs and patches are retained.
 
@@ -65,4 +76,4 @@ The optional [agent skill](.github/skills/verus-gap/SKILL.md) works with Copilot
 
 For Python package installation, `pip install .` also provides `verus-gap` and `verus-gap-setup`; its toolchain cache is `$XDG_CACHE_HOME/verus-gap` (or `~/.cache/verus-gap`, override with `VERUS_GAP_HOME`). The checkout's two commands use its local `.tools` directory. `--frontier` retains the old one-pass scanner for diagnostic comparison, not normal inventory use.
 
-See [validation and interpretation](VALIDATION.md) for the tested compiler/platform, the 114-test release checks, real setup/model/instrumentation controls, selected-range experiments, and remaining scientific limits. Per-project evidence is delivered separately in the `verus-gap-reports` bundle.
+See [validation and interpretation](VALIDATION.md) for the tested compiler/platform, the frozen 114-test release and current 128-test checkout, real setup/model/instrumentation controls, selected-range experiments, and remaining scientific limits. The previously published source/wheel archives remain unchanged and do not contain fast mode. Per-project evidence is delivered separately in the `verus-gap-reports` bundle.

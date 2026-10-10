@@ -438,16 +438,21 @@ def dependencies(project: Project, state: State, records: list[dict],
 def probe(project: Project, focus: str, output: Path, max_rounds: int | None = None,
           per_run: float = 60, expand_scope: bool = True) -> dict:
     state = State([focus])
+    mode = "adaptive" if expand_scope else "fast"
     summary = {
         "schema": "verus-gap/shard-v2", "focus": focus, "scope": [focus],
         "status": "partial", "stop_reason": "", "rounds": [], "observations": [],
         "events": [], "complete_inventory": False, "workspace_restored": False,
+        "scan_mode": mode, "dependency_boundary_limited": False,
     }
     revision = hashlib.sha256(json.dumps(project.manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
     checkpoint = output / "report.json"
     if checkpoint.is_file():
         previous = json.loads(checkpoint.read_text())
-        if previous.get("scanner_revision") == revision and previous["focus"] == focus:
+        if (
+            previous.get("scanner_revision") == revision and previous["focus"] == focus
+            and previous.get("scan_mode", "adaptive") == mode
+        ):
             summary = previous
             state.scope = list(previous["scope"])
             state.events = list(previous["events"])
@@ -486,6 +491,11 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             has_panic = panic is not None
             if panic:
                 records.append(panic)
+            if not expand_scope and any(
+                record["category"] == "checking_boundary" and record["level"] == "error"
+                for record in records
+            ):
+                summary["dependency_boundary_limited"] = True
             candidates = [
                 record for record in records
                 if record["category"] in {"language_rejection", "library_specification"}
@@ -548,6 +558,9 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             if not any(record["level"] == "error" for record in records) and result["exit_code"] == 0:
                 if blockers:
                     summary["stop_reason"] = "instrumentation_failure"
+                    break
+                if summary.get("dependency_boundary_limited"):
+                    summary["stop_reason"] = "focused_dependency_boundary"
                     break
                 exclusions = any(event["kind"] != "scope_expansion" for event in state.events)
                 summary["status"] = "frontier_cleared_after_exclusions" if exclusions else "frontend_clear"

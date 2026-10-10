@@ -24,6 +24,8 @@ A crate-defined `full` feature is automatically selected unless the user chooses
 
 Use `--package NAME` only for ambiguous workspaces, `--bin NAME` for a specific binary, or repeat `--file RELATIVE_PATH_OR_GLOB` to bound the scope. Prefer the user's requested scope; do not expand to unrelated repositories.
 
+When the user wants a quicker selected-source investigation rather than transitive dependency findings, add `--fast`. It retains native Cargo context and controls, but does not recursively expand checking into dependency files. The grouped report includes only observations with primary locations in selected files; unchanged raw context diagnostics remain available. Local checking boundaries are not library gaps. If encountered, they keep the focused frontier partial even after exclusions. Do not claim fast mode has the same recall on every project. Resume inherits the original mode; start a new scan to change it.
+
 Build scripts and macros execute in the copy. Use trusted input and preserve the original project.
 
 ## Read evidence before drawing a conclusion
