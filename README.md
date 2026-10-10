@@ -33,42 +33,36 @@ Use trusted projects: Cargo build scripts and procedural macros execute in the s
 
 **Then open the printed `report.md` path.** It contains the confirmed gaps, source locations, and coverage limits. Exit **1** means gaps were found, not that installation failed. For normal use, this is all you need.
 
----
+## What the report tells you
 
-## Optional reading
+Read the confirmed findings together with the coverage summary. A **partial** scan can contain confirmed gaps while some code remains unchecked; additional gaps may be hidden there. Counts are diagnostic/API groups, not a count of distinct unsupported Rust features.
 
-Normal scans need only the steps above. Choose a topic below when you need additional control or troubleshooting.
+The scanner does not prove program correctness. If it continued by temporarily excluding code, a later clear result does not establish support for the original program. `review.md` is for investigating a particular setup/compiler failure or why code remains unchecked; it is not required reading for every partial report.
 
-### Select sources and Cargo options
+## Working with your project
 
-Scan a file/module or choose Cargo features while retaining the containing crate's build context. See [scope and Cargo options](doc/REFERENCE.md#select-sources-and-cargo-options).
+### Scan only the code you care about
+
+Pass a source file or module directory instead of the whole crate, or select files with `--file`. The scanner still builds the containing crate, preserving dependencies, target settings, and generated files rather than treating the selected code as a standalone snippet.
+
+```bash
+./verus-gap /path/to/crate --file 'src/mm/*.rs' --jobs 32 --verbose
+```
+
+Only files active in the chosen Cargo configuration are scanned. Use `--features FEATURE` to include optional code; `full` is not enabled automatically. For an ambiguous workspace, choose `--package NAME` or pass the crate's directory. Use `--bin NAME` to select a binary.
 
 ### Optional build configuration
 
-Most projects need none. Use `--config PATH` for missing custom-target or build-script settings; matching profiles can also load automatically. See [configuration usage, format, and the Nanvix example](doc/REFERENCE.md#optional-build-configuration).
+Some projects rely on a Makefile or CI recipe to supply a custom target, features, or build-script environment variables. If the unchanged Rust build fails, inspect the reported error and `baseline.stdout` / `baseline.stderr`. Missing build context is a setup problem, not a Verus limitation; a configuration can supply those settings but cannot fix invalid Rust or missing tools.
 
-### Choose a scan level
+Most projects need no scanner configuration. The tool can automatically use `verus-gap.toml` at the Cargo workspace root or a matching bundled profile, such as the Nanvix kernel recipe, and prints what it selects. To supply your own build recipe:
 
-Keep level 2 normally. Use levels 1 or 0 only for deeper investigation or dependency findings. See [levels and tradeoffs](doc/REFERENCE.md#choose-a-scan-level).
+```bash
+./verus-gap /path/to/crate --config /path/to/build-settings.toml --jobs 32 --verbose
+```
 
-### Concurrency and live progress
+`--config` replaces automatic selection; `--no-config` disables it without disabling Cargo's own configuration. The [configuration reference](doc/REFERENCE.md#optional-build-configuration) explains the TOML fields, matching rules, and Nanvix example.
 
-Adjust workers for available resources, or interpret live progress and time budgets. See [concurrency and progress](doc/REFERENCE.md#concurrency-and-live-progress).
+## Further reading
 
-### Evidence and exit codes
-
-For partial results, raw compiler evidence, or exit-code interpretation, see [reports and evidence](doc/REFERENCE.md#evidence-and-exit-codes).
-
-### Refresh and resume
-
-Refresh saved reports without rerunning compilers, or continue an unfinished scan. See [refresh, interruption, and resume](doc/REFERENCE.md#refresh-and-resume).
-
-### Scope and safety
-
-A gap inventory is not a correctness proof. For copying restrictions, dependency handling, and unchecked code, see [scope and safety](doc/REFERENCE.md#scope-and-safety).
-
-### Other setup options
-
-For an existing Verus installation, a pinned release, or Python package installation, see [setup options](doc/REFERENCE.md#other-setup-options).
-
-Agents diagnosing a selected gap or crash should use the [diagnostic skill](.github/skills/verus-gap/SKILL.md). Detailed measurements are in [validation notes](doc/VALIDATION.md).
+The [command reference](doc/REFERENCE.md) covers detailed options and replay procedures. Use the [diagnostic skill](.github/skills/verus-gap/SKILL.md) when asking an agent to explain or repair a selected gap or crash. Performance measurements and evidence audits are kept separately in [validation notes](doc/VALIDATION.md).
