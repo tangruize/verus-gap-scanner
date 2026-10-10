@@ -120,7 +120,7 @@ Existing Verus-aware dependencies use official Cargo-Verus. Any support-version 
 
 External path dependencies, generated assets, and unusual platform setup may require a self-contained prepared copy. The tool refuses to copy your home/filesystem root or follow symlinks outside the workspace. Failed setup is reported, never relabeled as an application gap.
 
-Use the optional [agent skill](.github/skills/verus-gap/SKILL.md) to guide an agent through scanning and interpreting the evidence, or run the command directly in your terminal.
+For AI-assisted investigation, the optional [agent skill](.github/skills/verus-gap/SKILL.md) follows this README for usage and adds false-positive/root-cause analysis and solution-path assessment. A normal terminal scan needs no agent.
 
 ### Other setup options
 
