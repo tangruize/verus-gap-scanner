@@ -416,7 +416,7 @@ class ReportProgressTests(unittest.TestCase):
             with mock.patch("verus_gap.cli.save_report", return_value={"counts": {}}) as writing:
                 progress = ReportProgress(project, ["lib.rs"], completed, None)
                 progress.start("lib.rs", project.output / "shards" / "fixture")
-                progress.active = {"focus": "lib.rs", "observations": []}
+                progress.active["lib.rs"] = {"focus": "lib.rs", "observations": []}
                 progress.interrupt()
             self.assertEqual(writing.call_args.args[1], completed)
             self.assertEqual(project.manifest["scan_progress"], {"state": "interrupted"})

@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from verus_gap.engine import DependencyIndex, State, canonical, classify, compiler_panic, dependencies, execute, parse_output, probe
-from verus_gap.gap import run
+from verus_gap.gap import TimeBudgetExhausted, run
 from verus_gap.source import Cfg, Source
 
 
@@ -155,6 +155,34 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(report["stop_reason"], "round_limit")
         self.assertTrue(report["rounds"][0]["confirmation_performed"])
         self.assertTrue(any(record["category"] == "compiler_failure" for record in report["observations"]))
+
+    def test_global_deadline_expiring_in_a_probe_or_confirmation_is_a_time_budget_stop(self):
+        result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+        for phase in ("probe", "confirmation", "prelaunch"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                project = SimpleNamespace(
+                    manifest={"tool_sha256": {}}, sources={}, deadline=time.monotonic() + 30,
+                    verify_originals=mock.Mock(),
+                )
+                calls = 0
+
+                def executing(*args):
+                    nonlocal calls
+                    calls += 1
+                    if phase != "confirmation" or calls == 2:
+                        project.deadline = time.monotonic() - 1
+                        if phase == "prelaunch":
+                            raise TimeBudgetExhausted("budget exhausted during source preparation")
+                        return dict(result, timed_out=True), [self.support()], ""
+                    return result, [self.support()], ""
+
+                with mock.patch("verus_gap.engine.execute", side_effect=executing):
+                    report = probe(project, "lib.rs", Path(temporary), max_rounds=1)
+                self.assertEqual(report["stop_reason"], "time_budget")
+                self.assertEqual(report["status"], "partial")
+                self.assertTrue(report["workspace_restored"])
+                self.assertFalse(any(record["confirmed"] for record in report["observations"]))
+                self.assertEqual(calls, 2 if phase == "confirmation" else 1)
 
     def test_progress_does_not_change_observations_states_or_compiler_calls(self):
         support = self.support()

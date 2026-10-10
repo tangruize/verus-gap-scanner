@@ -16,6 +16,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 
 PACKAGE = Path(__file__).resolve().parent
 CHECKOUT = PACKAGE.parents[1]
@@ -32,6 +33,10 @@ class GapError(Exception):
     pass
 
 
+class TimeBudgetExhausted(GapError):
+    pass
+
+
 def capture_wrapper(output: Path) -> Path:
     wrapper = output / "capture-wrapper"
     wrapper.write_bytes((PACKAGE / "capture.py").read_bytes())
@@ -39,9 +44,12 @@ def capture_wrapper(output: Path) -> Path:
     return wrapper
 
 
-def run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> dict:
+def run(command: list[str], cwd: Path, env: dict[str, str], timeout: float,
+        *, cancel_event: Event | None = None) -> dict:
+    if cancel_event is not None and cancel_event.is_set():
+        raise KeyboardInterrupt
     if timeout <= 0:
-        raise GapError("Time budget exhausted before the next command.")
+        raise TimeBudgetExhausted("Time budget exhausted before the next command.")
     start = time.monotonic()
     try:
         proc = subprocess.Popen(
@@ -59,7 +67,22 @@ def run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> d
 
     timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        if cancel_event is None:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        else:
+            deadline = start + timeout
+            while True:
+                if cancel_event.is_set():
+                    raise KeyboardInterrupt
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    stdout, stderr = proc.communicate(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
     except subprocess.TimeoutExpired:
         timed_out = True
         stop(signal.SIGKILL)

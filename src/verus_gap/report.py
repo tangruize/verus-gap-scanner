@@ -150,6 +150,7 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
         "cargo_args": project.manifest["cargo_args"], "complete_inventory": False,
         "checks": project.manifest["checks"],
         "support_mode": project.manifest.get("support_mode"),
+        "jobs": project.manifest.get("jobs", 1),
         "scan_mode": "fast" if fast else "adaptive", "scan_level": level,
         "preparation_check": project.manifest.get("preparation_check"),
         "dependency_setup": project.manifest.get("dependency_setup"),
@@ -200,44 +201,73 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
             }
             for shard in shards
         ],
-        "workspace_restored": project.manifest["workspace_restored"],
+        "workspace_restored": project.manifest["workspace_restored"] and project.manifest.get("workers_restored", True),
         "confirmation": "Accepted support gaps reproduced twice with the same source overlay and compiler context.",
         "reporter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "outside_scope_evidence": outside,
     }
     if report["coverage"]["pending_files"]:
         report["status"] = "partial"
-    if not project.manifest["workspace_restored"]:
+    if not report["workspace_restored"] and project.manifest.get("scan_progress", {}).get("state") != "running":
         report["status"] = "restoration_failed"
     return report
 
 
+def active_files(progress: dict, selected: list[str]) -> list[str]:
+    if "active_files" in progress:
+        names = progress["active_files"]
+    else:
+        active = progress.get("active_file")
+        names = [] if active is None else [active]
+    if not isinstance(names, list) or not all(isinstance(name, str) and name in selected for name in names):
+        raise GapError("Saved active files are outside the selected scope or invalid.")
+    if len(set(names)) != len(names):
+        raise GapError("Saved active files contain duplicate frontiers.")
+    return names
+
+
 def scan_snapshot(manifest: dict, shards: list[dict], selected: list[str]) -> dict:
     progress = manifest.get("scan_progress", {})
-    active = progress.get("active_file")
+    names = active_files(progress, selected)
     interrupted = next((shard for shard in shards if shard["stop_reason"] == "interrupted"), None)
-    unfinished = next((shard for shard in shards if not shard["stop_reason"]), None)
+    unfinished = next((
+        shard for shard in shards if shard["stop_reason"] in {"", "time_budget", "execution_failure"}
+    ), None)
     state = progress.get("state")
     if state is None:
         state = "interrupted" if interrupted else (
             "finished" if len(shards) == len(selected) and not unfinished else "incomplete"
         )
-        active = (interrupted or unfinished or {}).get("focus")
+        names = [shard["focus"] for shard in shards if shard["stop_reason"] == "interrupted" or not shard["stop_reason"]]
     if state not in {"running", "finished", "interrupted", "stopped", "incomplete"}:
         raise GapError(f"Unknown saved scan progress state: {state!r}.")
-    if active is not None and active not in selected:
-        raise GapError(f"Saved active file is outside the selected scope: {active!r}.")
+    active = names[0] if len(names) == 1 else None
     current = next((shard for shard in shards if shard["focus"] == active), None)
     rounds = current.get("rounds", []) if current else []
-    return {
+    snapshot = {
         "state": state, "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "completed_files": sum(
-            bool(shard["stop_reason"]) and shard["stop_reason"] != "interrupted"
-            and shard["focus"] != active for shard in shards
+            shard["stop_reason"] not in {"", "interrupted", "time_budget", "execution_failure"}
+            and shard["focus"] not in names for shard in shards
         ),
         "selected_files": len(selected), "active_file": active,
         "last_completed_round": rounds[-1]["round"] if rounds else None,
     }
+    if len(names) > 1:
+        by_file = {shard["focus"]: shard for shard in shards}
+        snapshot["active_files"] = [
+            {
+                "file": name,
+                "last_completed_round": by_file[name]["rounds"][-1]["round"]
+                if name in by_file and by_file[name]["rounds"] else None,
+            }
+            for name in selected if name in names
+        ]
+    if "error" in progress:
+        if not isinstance(progress["error"], str):
+            raise GapError("Saved scan failure is not a diagnostic message.")
+        snapshot["error"] = progress["error"]
+    return snapshot
 
 
 def snapshot_lines(report: dict) -> list[str]:
@@ -252,12 +282,24 @@ def snapshot_lines(report: dict) -> list[str]:
         f"**Scan snapshot:** {labels[snapshot['state']]}; updated `{snapshot['updated_at']}`. "
         f"{snapshot['completed_files']}/{snapshot['selected_files']} file frontiers finished.", "",
     ]
+    if report.get("jobs", 1) > 1:
+        lines.extend([f"**File worker pool:** `{report['jobs']}`.", ""])
     if snapshot["active_file"] is not None:
         round_number = snapshot["last_completed_round"]
         detail = f"; last completed round `{round_number:03d}`" if round_number is not None else (
             "; no completed round yet"
         )
         lines.extend([f"**Current or interrupted file:** `{snapshot['active_file']}`{detail}.", ""])
+    active = snapshot.get("active_files", [])
+    if active:
+        lines.extend([f"**Current or interrupted files:** {len(active)}.", ""])
+        for frontier in active:
+            number = frontier["last_completed_round"]
+            detail = f"last completed round `{number:03d}`" if number is not None else "no completed round yet"
+            lines.append(f"- `{frontier['file']}`; {detail}.")
+        lines.append("")
+    if snapshot.get("error"):
+        lines.extend([f"**Scan stopped with an error:** {snapshot['error']}", ""])
     if snapshot["state"] != "finished":
         lines.extend([
             "This is a snapshot of completed, checkpointed rounds, not a finished scan. A running or interrupted probe/confirmation is not included; new findings count only after their confirmation is saved.", "",
@@ -385,7 +427,10 @@ def markdown(report: dict) -> str:
                       "They can still block exploration; their unchanged output is retained here:", ""])
         for item in report["outside_scope_evidence"]:
             lines.append(f"- `{item['category']}`: [raw evidence]({item['evidence']})")
-    lines.extend(["", f"**Scan sources restored:** `{report['workspace_restored']}`. Input sources were not edited.", ""])
+    restoration = "not yet verified while workers are active" if (
+        not report["workspace_restored"] and report.get("scan_progress", {}).get("state") == "running"
+    ) else str(report["workspace_restored"])
+    lines.extend(["", f"**Scan sources restored:** `{restoration}`. Input sources were not edited.", ""])
     return "\n".join(lines)
 
 
@@ -476,6 +521,7 @@ def saved_shards(output: Path, manifest: dict, selected: list[str]) -> tuple[lis
     index = manifest.get("shard_index", {})
     shards = []
     other_revisions = []
+    active = set(active_files(manifest.get("scan_progress", {}), selected))
     for focus in selected:
         recorded = index.get(focus)
         base = Path("shards") / hashlib.sha256(focus.encode()).hexdigest()[:12]
@@ -493,7 +539,7 @@ def saved_shards(output: Path, manifest: dict, selected: list[str]) -> tuple[lis
                 if recorded is not None:
                     progress = manifest.get("scan_progress", {})
                     if progress.get("state") in {"running", "interrupted", "stopped"} and (
-                        focus != progress.get("active_file")
+                        focus not in active
                     ):
                         other_revisions.append({
                             "file": focus, "checkpoint": str(checkpoint.relative_to(output)),
@@ -553,7 +599,7 @@ def saved_shards(output: Path, manifest: dict, selected: list[str]) -> tuple[lis
             shards.append(shard)
             found = True
             break
-        if recorded is not None and not found and manifest.get("scan_progress", {}).get("active_file") != focus:
+        if recorded is not None and not found and focus not in active:
             raise GapError(f"Missing saved checkpoint for {focus!r}.")
     return shards, other_revisions
 
@@ -589,6 +635,10 @@ def _refresh_report(output: Path) -> dict:
     ):
         raise GapError("The saved project/control metadata is invalid.")
     scan_level_from(manifest)
+    if "jobs" in manifest and (type(manifest["jobs"]) is not int or manifest["jobs"] < 1):
+        raise GapError("The saved worker count is invalid.")
+    if "workers_restored" in manifest and type(manifest["workers_restored"]) is not bool:
+        raise GapError("The saved worker restoration state is invalid.")
     cfg = Cfg([*manifest["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
     sources = {}
     for name, identity in active.items():

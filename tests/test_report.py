@@ -6,10 +6,12 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest import mock
 
@@ -17,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from verus_gap.project import write_json
 from verus_gap.report import (
     aggregate, atomic_text, language_family, main, markdown, public_api, refresh_report,
-    review_markdown, source_link,
+    review_markdown, save_report, source_link, write_report,
 )
 from verus_gap.source import Cfg, Source
 
@@ -115,6 +117,46 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(report["scan_progress"]["state"], "running")
             self.assertIsNone(report["scan_progress"]["last_completed_round"])
 
+    def test_manual_refresh_reports_all_active_workers_without_requiring_their_workspaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            second = Source("src/next.rs", b"pub fn next() {}\n", Cfg([]))
+            (output / "originals" / second.file).write_bytes(second.data)
+            manifest["active_sources"][second.file] = second.identity()
+            manifest["selected_files"].append(second.file)
+            manifest["jobs"] = 32
+            manifest["scan_progress"] = {"state": "running", "active_files": [shard["focus"], second.file]}
+            manifest["shard_index"][second.file] = "shards/not-started"
+            write_json(output / "project.json", manifest)
+            report = refresh_report(output)
+            self.assertEqual(report["jobs"], 32)
+            self.assertEqual(report["coverage"]["pending_files"], 1)
+            self.assertEqual(report["scan_progress"]["active_files"], [
+                {"file": shard["focus"], "last_completed_round": 0},
+                {"file": second.file, "last_completed_round": None},
+            ])
+            self.assertIn("Current or interrupted files", (output / "report.md").read_text())
+            self.assertFalse((output / "workers").exists())
+
+    def test_invalid_worker_metadata_does_not_overwrite_a_previous_report(self):
+        cases = [
+            ("jobs", 0), ("jobs", True), ("workers_restored", "yes"),
+            ("active_files", ["src/lib.rs", "src/lib.rs"]), ("active_files", ["outside.rs"]),
+        ]
+        for key, value in cases:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, shard, checkpoint = self.saved_result(temporary)
+                if key == "active_files":
+                    manifest["scan_progress"][key] = value
+                else:
+                    manifest[key] = value
+                write_json(output / "project.json", manifest)
+                report = output / "report.md"
+                report.write_text("previous report")
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(main([str(output)]), 2)
+                self.assertEqual(report.read_text(), "previous report")
+
     def test_manual_refresh_during_revision_specific_resume_does_not_mix_old_findings(self):
         with tempfile.TemporaryDirectory() as temporary:
             output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
@@ -207,6 +249,105 @@ class ReportTests(unittest.TestCase):
             self.assertIn("interrupted", (output / "review.md").read_text())
             self.assertEqual(checkpoint.read_bytes(), before)
             self.assertEqual(list(output.glob(".*.tmp")), [])
+
+    def test_worker_publication_excludes_partial_evidence_and_unpublished_checkpoints(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            second = Source("src/next.rs", b"pub fn next() {}\n", Cfg([]))
+            (output / "originals" / second.file).write_bytes(second.data)
+            manifest["active_sources"][second.file] = second.identity()
+            manifest["selected_files"].append(second.file)
+            manifest["scan_progress"] = {"state": "running", "active_files": [shard["focus"], second.file]}
+            directory = output / "shards/second"
+            directory.mkdir()
+            manifest["shard_index"][second.file] = "shards/second"
+            write_json(output / "project.json", manifest)
+            next_shard = copy.deepcopy(shard)
+            next_shard.update(focus=second.file, scope=[second.file])
+            for record in next_shard["observations"]:
+                record["scope"] = [second.file]
+                record["locations"][0].update(file=second.file, source="pub fn next() {}")
+                record["message"] = "second completed model" if record["confirmed"] else "second unconfirmed"
+            staged, publish = Event(), Event()
+
+            def writing_worker():
+                evidence = directory / "round-000/verus.txt"
+                evidence.parent.mkdir()
+                evidence.write_text("partially written initial diagnostic")
+                (directory / "report.json.tmp").write_text('{"unfinished":')
+                staged.set()
+                if not publish.wait(10):
+                    raise TimeoutError("checkpoint publication was not released")
+                evidence.write_text("completed initial diagnostic")
+                confirmation = evidence.parent / "confirmation/verus.txt"
+                confirmation.parent.mkdir()
+                confirmation.write_text("completed repeated diagnostic")
+                write_json(directory / "report.json", next_shard)
+
+            with ThreadPoolExecutor(max_workers=3) as workers:
+                writer = workers.submit(writing_worker)
+                try:
+                    self.assertTrue(staged.wait(10))
+                    snapshots = list(workers.map(lambda _: refresh_report(output), range(4)))
+                    for report in snapshots:
+                        self.assertEqual(report["counts"]["library_specification"], 1)
+                        self.assertEqual(report["coverage"]["pending_files"], 1)
+                        self.assertTrue(all(group["message"] != "second completed model" for group in report["groups"]))
+                finally:
+                    publish.set()
+                writer.result(timeout=10)
+            report = refresh_report(output)
+            self.assertEqual(report["counts"]["library_specification"], 2)
+            self.assertEqual(report["coverage"]["pending_files"], 0)
+            self.assertEqual(report["counts"]["unconfirmed_support_diagnostic"], 2)
+            self.assertFalse((directory / "report.json.tmp").exists())
+
+    def test_automatic_and_manual_report_writers_share_the_same_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            source = Source("src/lib.rs", (output / "originals/src/lib.rs").read_bytes(), Cfg([]))
+            project = SimpleNamespace(output=output, manifest=manifest, sources={source.file: source})
+            shard["directory"] = str(checkpoint.parent.relative_to(output))
+            lock = Lock()
+            concurrent = 0
+            highest = 0
+
+            def writing(path, report):
+                nonlocal concurrent, highest
+                with lock:
+                    concurrent += 1
+                    highest = max(highest, concurrent)
+                try:
+                    time.sleep(0.01)
+                    write_report(path, report)
+                finally:
+                    with lock:
+                        concurrent -= 1
+
+            with mock.patch("verus_gap.report.write_report", side_effect=writing), ThreadPoolExecutor(max_workers=4) as workers:
+                calls = [
+                    workers.submit(save_report, project, [shard], manifest["selected_files"])
+                    if number % 2 else workers.submit(refresh_report, output)
+                    for number in range(8)
+                ]
+                reports = [future.result(timeout=10) for future in calls]
+            self.assertEqual(highest, 1)
+            self.assertTrue(all(report["counts"]["library_specification"] == 1 for report in reports))
+            self.assertEqual(json.loads((output / "report.json").read_text())["groups"], reports[-1]["groups"])
+            self.assertEqual(list(output.glob(".*.tmp")), [])
+
+    def test_running_workers_wait_for_restoration_without_claiming_a_restoration_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            manifest["workers_restored"] = False
+            write_json(output / "project.json", manifest)
+            report = refresh_report(output)
+            self.assertFalse(report["workspace_restored"])
+            self.assertNotEqual(report["status"], "restoration_failed")
+            self.assertIn("not yet verified while workers are active", (output / "report.md").read_text())
+            manifest["scan_progress"]["state"] = "stopped"
+            write_json(output / "project.json", manifest)
+            self.assertEqual(refresh_report(output)["status"], "restoration_failed")
 
     def test_source_link_uses_the_original_file_and_preserves_visible_line_and_column(self):
         place = {"file": "src/engine/general_purpose/decode.rs", "line": 122, "column": 5}

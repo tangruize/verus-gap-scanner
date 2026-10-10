@@ -9,11 +9,13 @@ import json
 import sys
 import time
 from collections import Counter
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .engine import canonical, probe
 from .gap import GapError
+from .parallel import Work, scan as parallel_scan
 from .project import DEFAULT_SCAN_LEVEL, Project, prepare, resume, scan_level_from, write_json
 from .report import atomic_text, main as report_main, public_api, report_lock, save_report
 
@@ -26,27 +28,39 @@ class ReportProgress:
         self.shards = shards
         self.verbose = verbose
         self.counts = verbose or VerboseProgress(selected, fast=scan_level_from(project.manifest) > 0)
-        self.directory: Path | None = None
-        self.active: dict | None = None
+        self.directories: dict[str, Path] = {}
+        self.active: dict[str, dict] = {}
         self.last_refresh = time.monotonic()
         self.report: dict | None = None
         self.published_groups: set[tuple] = set()
 
     def start(self, focus: str, directory: Path):
-        self.directory = directory
-        self.active = None
+        self.directories[focus] = directory
+        self.active.pop(focus, None)
         relative = str(directory.relative_to(self.project.output))
-        self.project.manifest["scan_progress"] = {
-            "state": "running", "active_file": focus, "active_shard": relative,
-        }
         self.project.manifest.setdefault("shard_index", {})[focus] = relative
+        self.save_progress("running")
+
+    def save_progress(self, state: str, error: str | None = None):
+        names = [name for name in self.selected if name in self.directories]
+        progress: dict = {"state": state}
+        if len(names) == 1:
+            progress.update(active_file=names[0], active_shard=str(
+                self.directories[names[0]].relative_to(self.project.output),
+            ))
+        elif names:
+            progress["active_files"] = names
+        if error is not None:
+            progress["error"] = error
+        self.project.manifest["scan_progress"] = progress
         self.project.save()
 
     def refresh(self) -> dict:
-        current = self.active
         shards = list(self.shards)
-        if current is not None and not any(shard["focus"] == current.get("focus") for shard in shards):
-            shards.append(current)
+        completed = {shard.get("focus") for shard in shards}
+        shards.extend(shard for focus, shard in self.active.items() if focus not in completed)
+        order = {name: index for index, name in enumerate(self.selected)}
+        shards.sort(key=lambda shard: order.get(shard.get("focus"), len(order)))
         report = save_report(self.project, shards, self.selected)
         self.report = report
         self.published_groups = set(self.counts.groups)
@@ -58,42 +72,58 @@ class ReportProgress:
             time.monotonic() - self.last_refresh >= 60
         )
 
-    def finish_file(self) -> dict:
+    def finish_file(self, focus: str | None = None) -> dict:
         if self.shards:
             self.counts.observe(self.shards[-1].get("observations", []), announce=False)
-        self.active = None
-        self.directory = None
-        self.project.manifest["scan_progress"] = {"state": "running"}
-        self.project.save()
+            focus = focus or self.shards[-1].get("focus")
+        if focus is None and len(self.directories) == 1:
+            focus = next(iter(self.directories))
+        if focus is not None:
+            self.active.pop(focus, None)
+            self.directories.pop(focus, None)
+        self.save_progress("running")
         if self.report is None or self.refresh_due():
             return self.refresh()
         return self.report
 
     def finish(self, state: str) -> dict:
-        self.project.manifest["scan_progress"] = {"state": state}
-        self.project.save()
+        self.save_progress(state)
+        return self.refresh()
+
+    def recover(self, state: str, error: str | None = None) -> dict:
+        completed = {shard["focus"] for shard in self.shards}
+        for focus, directory in list(self.directories.items()):
+            if focus in completed:
+                self.active.pop(focus, None)
+                self.directories.pop(focus, None)
+                continue
+            checkpoint = directory / "report.json"
+            if checkpoint.is_file():
+                shard = dict(
+                    json.loads(checkpoint.read_text()),
+                    directory=str(directory.relative_to(self.project.output)),
+                )
+                self.counts.observe(shard.get("observations", []), announce=False)
+                if shard["stop_reason"] and shard["stop_reason"] != "interrupted":
+                    self.shards.append(shard)
+                    self.active.pop(focus, None)
+                    self.directories.pop(focus, None)
+                else:
+                    self.active[focus] = shard
+        self.project.verify_originals()
+        self.save_progress(state, error)
         return self.refresh()
 
     def interrupt(self) -> dict:
-        progress = self.project.manifest.get("scan_progress", {})
-        if any(shard["focus"] == progress.get("active_file") for shard in self.shards):
-            self.active = None
-            progress = {}
-        elif self.directory is not None:
-            checkpoint = self.directory / "report.json"
-            if checkpoint.is_file():
-                self.active = dict(
-                    json.loads(checkpoint.read_text()),
-                    directory=str(self.directory.relative_to(self.project.output)),
-                )
-        self.project.manifest["scan_progress"] = {**progress, "state": "interrupted"}
-        self.project.verify_originals()
-        return self.refresh()
+        return self.recover("interrupted")
 
     def __call__(self, phase: str, details: dict):
-        if phase in {"restore", "round"} and self.directory is not None:
-            self.active = dict(
-                details["summary"], directory=str(self.directory.relative_to(self.project.output)),
+        focus = details.get("focus")
+        if focus is None and len(self.directories) == 1:
+            focus = next(iter(self.directories))
+        if phase in {"restore", "round"} and focus in self.directories:
+            self.active[focus] = dict(
+                details["summary"], directory=str(self.directories[focus].relative_to(self.project.output)),
             )
         if self.verbose is not None:
             self.verbose(phase, details)
@@ -193,6 +223,21 @@ class VerboseProgress:
             raise ValueError(f"Unknown progress phase: {phase}")
 
 
+def plan_frontier(project: Project, name: str, revision: str, level: int, resuming: bool) -> tuple[Path, dict | None]:
+    base = project.output / "shards" / hashlib.sha256(name.encode()).hexdigest()[:12]
+    directory = base if not base.exists() else base / revision
+    saved = project.manifest.get("shard_index", {}).get(name)
+    cached_path = project.output / saved if saved else base
+    if resuming and (cached_path / "report.json").is_file():
+        cached = json.loads((cached_path / "report.json").read_text())
+        if cached.get("scanner_revision") == revision and scan_level_from(cached) == level:
+            if cached["status"] != "partial" or level == 2 and cached["stop_reason"] == "checking_boundary_only":
+                return cached_path, cached
+            return cached_path, None
+        directory = base / revision
+    return directory, None
+
+
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
     if values[:1] == ["report"]:
@@ -204,6 +249,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if "--verbose" in options:
             print("error: --verbose is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
+            return 2
+        if any(option == "--jobs" or option.startswith("--jobs=") for option in options):
+            print("error: --jobs is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
             return 2
         values.remove("--frontier")
         from .gap import main as frontier
@@ -227,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
                              "(default for new scans); resume inherits its level")
     parser.add_argument("--verbose", action="store_true",
                         help="show live round progress and newly confirmed limitation groups")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="pooled file workers (default: 1); each uses a private source copy")
     parser.add_argument("--out", help="new result directory")
     parser.add_argument("--resume", help="continue a result directory without rebuilding dependencies")
     parser.add_argument("--verus", help="existing complete Verus distribution")
@@ -234,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(values)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.jobs <= 0:
+        parser.error("--jobs must be positive")
     requested_level = args.scan_level
     if args.features:
         cargo.extend(["--features", args.features])
@@ -270,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         mode = "adaptive" if level == 0 else "fast"
         project.manifest["scan_level"] = level
         project.manifest["scan_mode"] = mode
+        project.manifest["jobs"] = args.jobs
+        project.manifest.pop("workers_restored", None)
         selected = list(project.sources)
         if args.resume and not args.file and project.manifest.get("selected_files"):
             selected = project.manifest["selected_files"]
@@ -287,62 +341,70 @@ def main(argv: list[str] | None = None) -> int:
                 raise GapError("No requested source file is active in this Cargo configuration.")
         project.manifest["selected_files"] = selected
         project.save()
+        project.verify_originals()
         progress = VerboseProgress(selected, fast=level > 0) if args.verbose else None
         if progress is not None:
-            progress.write(f"[scan] level={level}; mode={mode}; {len(selected)} selected file(s); reports: {output}")
+            progress.write(
+                f"[scan] level={level}; mode={mode}; jobs={args.jobs}; "
+                f"{len(selected)} selected file(s); reports: {output}"
+            )
         shards = []
         reporting = ReportProgress(project, selected, shards, progress)
         project.manifest["scan_progress"] = {"state": "running"}
         project.save()
         reporting.refresh()
         revision = hashlib.sha256(json.dumps(project.manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
+
+        def start(item: Work):
+            if progress is not None:
+                progress.write(f"[file {item.number + 1}/{len(selected)}] {item.focus}")
+            reporting.start(item.focus, item.directory)
+
+        def complete(item: Work, result: dict, *, cached: bool = False):
+            result["focus"] = item.focus
+            result["scanner_revision"] = revision
+            result["directory"] = str(item.directory.relative_to(output))
+            if not cached:
+                write_json(item.directory / "report.json", result)
+            project.manifest.setdefault("shard_index", {})[item.focus] = result["directory"]
+            shards.append(result)
+            reporting.finish_file(item.focus)
+            accepted = len(reporting.counts.groups)
+            print(f"[{len(shards)}/{len(selected)}] {item.focus}: {result['stop_reason']}; "
+                  f"{accepted} reproducible support-gap groups so far.", flush=True)
+            if result["stop_reason"] == "execution_failure":
+                raise GapError(f"Execution failed for {item.focus}: {result.get('error', 'see its shard checkpoint')}.")
+
+        pending = []
         for index, name in enumerate(selected):
             if time.monotonic() >= project.deadline:
                 break
-            if progress is not None:
-                progress.write(f"[file {index + 1}/{len(selected)}] {name}")
-            base = output / "shards" / hashlib.sha256(name.encode()).hexdigest()[:12]
-            directory = base if not base.exists() else base / revision
-            saved = project.manifest.get("shard_index", {}).get(name)
-            cached_path = output / saved if saved else base
-            if args.resume and (cached_path / "report.json").is_file():
-                cached = json.loads((cached_path / "report.json").read_text())
-                same_scan = (
-                    cached.get("scanner_revision") == revision
-                    and scan_level_from(cached) == level
-                )
-                if same_scan and (
-                    cached["status"] != "partial"
-                    or level == 2 and cached["stop_reason"] == "checking_boundary_only"
-                ):
-                    result, directory = cached, cached_path
-                    if progress is not None:
-                        progress("restore", {"observations": cached["observations"]})
-                        progress.write(f"[reuse] {name}; using saved frontier without new probes")
-                elif same_scan:
-                    directory = cached_path
-                    reporting.start(name, directory)
-                    result = probe(project, name, directory, scan_level=level, progress=reporting)
-                else:
-                    directory = base / revision
-                    reporting.start(name, directory)
-                    result = probe(project, name, directory, scan_level=level, progress=reporting)
+            directory, cached = plan_frontier(project, name, revision, level, bool(args.resume))
+            item = Work(index, name, directory)
+            if cached is not None:
+                if progress is not None:
+                    progress("restore", {"observations": cached["observations"]})
+                    progress.write(f"[reuse] {name}; using saved frontier without new probes")
+                complete(item, cached, cached=True)
             else:
-                reporting.start(name, directory)
-                result = probe(project, name, directory, scan_level=level, progress=reporting)
-            result["scanner_revision"] = revision
-            result["directory"] = str(directory.relative_to(output))
-            write_json(directory / "report.json", result)
-            project.manifest.setdefault("shard_index", {})[name] = result["directory"]
-            shards.append(result)
-            report = reporting.finish_file()
-            accepted = len(reporting.counts.groups)
-            print(f"[{index + 1}/{len(selected)}] {name}: {result['stop_reason']}; "
-                  f"{accepted} reproducible support-gap groups so far.", flush=True)
+                pending.append(item)
+        if args.jobs == 1:
+            for item in pending:
+                if time.monotonic() >= project.deadline:
+                    break
+                start(item)
+                complete(item, probe(project, item.focus, item.directory, scan_level=level, progress=reporting))
+        else:
+            with closing(parallel_scan(project, pending, args.jobs, level, start, reporting)) as results:
+                for item, result in results:
+                    complete(item, result)
         project.verify_originals()
-        report = reporting.finish("finished" if len(shards) == len(selected) else "stopped")
+        finished = len(shards) == len(selected) and not any(
+            shard["stop_reason"] == "time_budget" for shard in shards
+        )
+        report = reporting.finish("finished" if finished else "stopped")
         print(f"\n{report['status']}: {output / 'report.md'}", flush=True)
-        if report["coverage"]["pending_files"]:
+        if not finished:
             return 2
         if any(report["counts"].get(category, 0)
                for category in ("language_rejection", "library_specification")):
@@ -350,6 +412,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2 if report["coverage"]["partial_files"] else 0
     except (GapError, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
+        if reporting is not None:
+            try:
+                reporting.recover("stopped", str(error))
+            except (GapError, OSError, UnicodeError, json.JSONDecodeError) as report_error:
+                print(f"error: Could not refresh stopped reports: {report_error}", file=sys.stderr)
+            return 2
         output.mkdir(parents=True, exist_ok=True)
         try:
             with report_lock(output):

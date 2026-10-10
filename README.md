@@ -49,6 +49,18 @@ All levels use the same build checks and confirm each new support finding with a
 
 A **checking boundary** means Verus cannot currently use a referenced type, function, or trait because it is outside checking or has been explicitly excluded. This can happen inside your selected file as well as at a dependency. It is a checking obstacle, not automatically a Verus language or library-model gap. Level 1 keeps trying to work around these obstacles; level 2 stops when they are the only errors left, with no setup or instrumentation blocker. The report stays **partial** and retains those errors in `review.md`; more gaps may be hidden behind them.
 
+Use **`--jobs N`** to scan files concurrently. The default is **1**. Workers form a fixed-size pool: whichever becomes free takes the next file, rather than receiving a fixed chunk of files up front. Each file keeps its own exploration and repeated-confirmation state; rounds within a file remain sequential. The selected scope and scan level are unchanged.
+
+```bash
+./verus-gap /path/to/crate --jobs 8 --verbose
+./verus-gap /path/to/crate --jobs 32 --verbose
+./verus-gap --resume /path/to/verus-gap-results/RESULT --jobs 32
+```
+
+Cargo setup and build controls run once. Each worker uses a private writable source copy and independent compiler outputs, while captured dependency/support artifacts remain shared inputs. A worker publishes an atomic checkpoint only after the round's initial and required confirmation evidence is fully written; unfinished runs and temporary checkpoint files are not included in reports. Only the coordinator writes the combined reports and checkpoint index; manual refresh shares the global report lock. Completed counts reflect finished files, not fixed worker partitions; report ordering follows the selected file order even when completion order differs. More workers use more CPU, memory and disk I/O, so choose a count appropriate for your machine rather than expecting linear speedup. The total timeout applies to the whole scan, not separately to each worker.
+
+`--jobs` may be changed on resume without changing the recorded scan level or reproving reusable file frontiers. Worker copies and their replay context are retained under `workers/`; they are not needed for evidence-only report refresh. During a pooled scan, worker restoration is not claimed until shutdown verifies the copies. Ctrl+C cancels queued work, stops running compiler processes, waits for source restoration, and saves all completed rounds, including each active file; repeated Ctrl+C during pool shutdown does not bypass restoration. A worker failure exits 2 and retains a stopped snapshot with its error and available evidence.
+
 Add **`--verbose`** to see live probe/confirmation phases, round timings, scope expansion or exclusion actions, cumulative group counts, and newly confirmed limitations with original error messages and source locations:
 
 ```bash
@@ -58,7 +70,7 @@ Add **`--verbose`** to see live probe/confirmation phases, round timings, scope 
 
 Output is flushed as progress becomes available, including through a file or pipe. A limitation is announced only after its confirmation and evidence have been saved. Repeated groups are not announced again; selected-source and dependency findings are labeled separately. Setup errors, checking boundaries and compiler failures are not announced as limitations. The final reports and raw evidence are still saved normally. Verbosity changes display only and can be enabled or disabled on resume.
 
-Reports are available as soon as setup finishes. During scanning, completed rounds and files refresh them only when at least one minute has elapsed and a new confirmed diagnostic/API group has been found since the previous automatic refresh. Repeated locations, checking boundaries, and progress changes alone do not trigger another full rewrite; file completion does not bypass these conditions. Normal exit always refreshes them immediately. A long-running probe or confirmation keeps the previous snapshot until the round finishes. **Ctrl+C** restores the scan copy and writes an **interrupted** report using the latest completed rounds, including findings from the current file. Pending files and unfinished frontiers stay visible; a partially completed confirmation is never counted as a confirmed gap.
+Reports are available as soon as setup finishes. During scanning, completed rounds and files refresh them only when at least one minute has elapsed and a new confirmed diagnostic/API group has been found since the previous automatic refresh. Repeated locations, checking boundaries, and progress changes alone do not trigger another full rewrite; file completion does not bypass these conditions. Normal exit always refreshes them immediately. A long-running probe or confirmation keeps the previous snapshot until the round finishes. **Ctrl+C** restores the scan copies and writes an **interrupted** report using the latest completed rounds, including findings from every active file. Pending files and unfinished frontiers stay visible; a partially completed confirmation is never counted as a confirmed gap.
 
 Refresh an existing result manually, including while a scan is running:
 
@@ -84,6 +96,7 @@ Open the printed **`report.md`**. Its summary groups language rejections by erro
 | `review.md` | Local checking boundaries, migration requirements, instrumentation/setup problems, and compiler failures; not counted as support gaps |
 | `project.json` / `replay.json` | Build configuration, compiler/support identities, adaptation records, and exact replay context |
 | `shards/` | Every round's raw output, copied sources, source maps/edits, and confirmation run |
+| `workers/` | Private parallel source copies and their replay context |
 | `agent-tasks.json` | Bounded follow-up tasks for an optional agent |
 
 **Exit 0:** the selected frontiers cleared without accepted gaps. **Exit 1:** reproduced gaps were found; coverage may still be partial. **Exit 2:** setup failed, the scan budget left files pending, or only unresolved frontiers remain. Always inspect the report, including on nonzero exits.

@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .gap import GapError, run, save_run
+from .gap import GapError, TimeBudgetExhausted, run, save_run
 from .project import DEFAULT_SCAN_LEVEL, Project, scan_level_from, write_json
 from .source import Declaration, Rendered
 
@@ -261,8 +261,11 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
     maps: dict[str, Rendered] = {}
     modified = []
     modules = context_modules(project, state.scope)
+    cancel = getattr(project, "cancel_event", None)
     try:
         for name, source in project.sources.items():
+            if cancel is not None and cancel.is_set():
+                raise KeyboardInterrupt
             scoped = name in state.scope
             mapped = source.render(
                 state.bodies.get(name, set()), state.external.get(name, set()) | modules.get(name, set()),
@@ -289,7 +292,10 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
         index = max(index for index, value in enumerate(command) if value == "--out-dir")
         command[index + 1] = str(directory / "verus-build")
         Path(command[index + 1]).mkdir(exist_ok=True)
-        result = run(command, project.cwd, project.env, min(timeout, project.deadline - time.monotonic()))
+        remaining = min(timeout, project.deadline - time.monotonic())
+        result = run(command, project.cwd, project.env, remaining, cancel_event=cancel) if cancel is not None else (
+            run(command, project.cwd, project.env, remaining)
+        )
         metadata = save_run(directory, "verus", result)
         records, human = parse_output(result["stderr"] + "\n" + result["stdout"], project, maps)
         (directory / "verus.txt").write_text(human)
@@ -488,6 +494,9 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
     notify("restore", observations=list(summary["observations"]), summary=summary)
     try:
         for number in range(start, start + budget):
+            cancel = getattr(project, "cancel_event", None)
+            if cancel is not None and cancel.is_set():
+                raise KeyboardInterrupt
             if time.monotonic() >= project.deadline:
                 summary["stop_reason"] = "time_budget"
                 break
@@ -517,12 +526,14 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             ]
             confirmed = set()
             confirmation_seconds = 0.0
+            confirmation_timed_out = False
             new_candidates = [record for record in candidates if record_key(record) not in accepted]
             if new_candidates or panic:
                 notify("confirmation", round=number, candidates=len(new_candidates),
                        compiler_failure=has_panic)
                 second, repeated, _ = execute(project, state, directory / "confirmation", per_run)
                 confirmation_seconds = second["seconds"]
+                confirmation_timed_out = second["timed_out"]
                 repeated_panic = compiler_panic(second, project, state)
                 if panic and repeated_panic and not second["timed_out"]:
                     confirmed.add(record_key(repeated_panic))
@@ -571,7 +582,10 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                    confirmation_performed=bool(new_candidates or panic), blockers=blockers,
                    summary=summary)
             if result["timed_out"]:
-                summary["stop_reason"] = "per_run_timeout"
+                summary["stop_reason"] = "time_budget" if time.monotonic() >= project.deadline else "per_run_timeout"
+                break
+            if confirmation_timed_out and time.monotonic() >= project.deadline:
+                summary["stop_reason"] = "time_budget"
                 break
             event_offset = len(state.events)
             if panic:
@@ -629,6 +643,8 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
     except KeyboardInterrupt:
         summary["stop_reason"] = "interrupted"
         raise
+    except TimeBudgetExhausted:
+        summary["stop_reason"] = "time_budget"
     except (GapError, OSError, UnicodeError) as error:
         summary["stop_reason"] = "execution_failure"
         summary["error"] = str(error)

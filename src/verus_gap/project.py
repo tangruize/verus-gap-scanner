@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from threading import Event
 
 from .gap import (
     GapError, PACKAGE, active_sources, discover_manifest, find_verus, identity,
@@ -51,17 +52,22 @@ class Project:
     sources: dict[str, Source]
     manifest: dict
     deadline: float
+    cancel_event: Event | None = None
 
     @cached_property
     def source_paths(self) -> dict[str, Path]:
-        return {name: (self.workspace / name).resolve() for name in self.sources}
+        paths = {name: (self.workspace / name).resolve() for name in self.sources}
+        for name, path in paths.items():
+            if not path.is_relative_to(self.workspace):
+                raise GapError(f"Active source leaves the private scan workspace: {name}")
+        return paths
 
     def save(self):
         write_json(self.output / "project.json", self.manifest)
 
     def verify_originals(self):
-        for name, source in self.sources.items():
-            path = self.workspace / name
+        for name, path in self.source_paths.items():
+            source = self.sources[name]
             if path.read_bytes() != source.data:
                 raise GapError(f"Scan copy was not restored: {name}")
         self.manifest["workspace_restored"] = True
