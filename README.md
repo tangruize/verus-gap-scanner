@@ -23,7 +23,7 @@ git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap
 
 This selects the Tokio library and keeps its default Cargo features. Tokio enables none by default; add `--features full` only when you want to investigate its optional runtime, networking, and other APIs.
 
-**Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
+The examples use 32 parallel workers; lower `--jobs` on smaller or busy machines.
 
 For your own crate:
 
