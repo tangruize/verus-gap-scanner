@@ -139,6 +139,7 @@ class VerboseProgress:
         self.fast = fast
         self.groups: set[tuple] = set()
         self.selected_groups: set[tuple] = set()
+        self.ready_workers: set[int] = set()
         self.started = time.monotonic()
 
     def write(self, message: str):
@@ -177,6 +178,25 @@ class VerboseProgress:
                     self.write(f"  API: {api}")
 
     def __call__(self, phase: str, details: dict):
+        if phase == "pool":
+            self.write(f"[pool] starting {details['jobs']} process workers; dispatched files are not completed files")
+            return
+        if phase == "worker":
+            label = f"[worker {details['worker']}/{details['jobs']} pid={details['pid']}]"
+            if details["stage"] == "models":
+                self.write(f"{label} loading cached source models; no reparsing")
+            elif details["stage"] == "copy":
+                self.write(f"{label} copying private workspace; {details['completed']} files copied")
+            elif details["stage"] == "ready":
+                self.ready_workers.add(details["worker"])
+                self.write(
+                    f"{label} ready in {details['seconds']:.2f}s; "
+                    f"{len(self.ready_workers)}/{details['jobs']} workers ready; "
+                    f"{details['sources']} cached source models reused"
+                )
+            else:
+                raise ValueError(f"Unknown worker initialization stage: {details['stage']}")
+            return
         if phase == "restore":
             self.observe(details["observations"], announce=False)
             return
@@ -276,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true",
                         help="show live round progress and newly confirmed limitation groups")
     parser.add_argument("--jobs", type=int, default=1,
-                        help="pooled file workers (default: 1); each uses a private source copy")
+                        help="pooled file processes (default: 1); private sources and cached source models")
     parser.add_argument("--out", help="new result directory")
     parser.add_argument("--resume", help="continue a result directory without rebuilding dependencies")
     parser.add_argument("--verus", help="existing complete Verus distribution")

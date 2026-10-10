@@ -9,6 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 from functools import cached_property
+from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 from threading import Event
 
@@ -52,7 +53,7 @@ class Project:
     sources: dict[str, Source]
     manifest: dict
     deadline: float
-    cancel_event: Event | None = None
+    cancel_event: Event | ProcessEvent | None = None
 
     @cached_property
     def source_paths(self) -> dict[str, Path]:

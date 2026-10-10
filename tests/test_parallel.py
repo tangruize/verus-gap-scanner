@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import pickle
 import signal
 import subprocess
 import sys
@@ -11,19 +12,99 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event
 from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from verus_gap.cli import ReportProgress, main
+from verus_gap.cli import ReportProgress, VerboseProgress, main
 from verus_gap.gap import GapError, run
-from verus_gap.parallel import Work, rebind_driver_environment, scan
+from verus_gap.parallel import Work, Worker, Workers, rebind_driver_environment, scan, worker_main
 from verus_gap.project import Project
 from verus_gap.source import Cfg, Source
+
+
+def fixture_probe(project, focus, directory, *, progress, **options):
+    directory.mkdir(parents=True, exist_ok=True)
+    fixture = Path(project.manifest["fixture_root"])
+    mode = project.manifest.get("fixture_mode")
+    (directory / "worker.json").write_text(json.dumps({
+        "pid": os.getpid(), "workspace": str(project.workspace),
+        "cwd": str(project.cwd), "command": project.command, "env": project.env,
+        "source_identities": {name: source.identity() for name, source in project.sources.items()},
+    }))
+
+    def started(name):
+        (fixture / name).touch()
+
+    def wait_for(name):
+        deadline = time.monotonic() + 10
+        while not (fixture / name).exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"Timed out waiting for {name}")
+            time.sleep(0.005)
+
+    if mode == "dynamic":
+        if focus == "a.rs":
+            started("first-started")
+            wait_for("third-started")
+        elif focus == "b.rs":
+            wait_for("first-started")
+        else:
+            started("third-started")
+    elif mode == "isolation":
+        path = project.workspace / "a.rs"
+        path.write_bytes(f"private {focus}".encode())
+        try:
+            started(f"{focus}-started")
+            wait_for("b.rs-started" if focus == "a.rs" else "a.rs-started")
+            if path.read_bytes() != f"private {focus}".encode():
+                raise AssertionError("Worker sources were shared")
+            parent = Path(project.manifest["parent_workspace"]) / "a.rs"
+            if parent.read_bytes() != project.sources["a.rs"].data:
+                raise AssertionError("Coordinator sources were modified")
+            if parent.stat().st_ino == path.stat().st_ino:
+                raise AssertionError("Writable sources were hardlinked")
+        finally:
+            path.write_bytes(project.sources["a.rs"].data)
+    elif mode == "snapshots":
+        summary = {"focus": focus, "rounds": [{"round": 0}]}
+        progress("round", {"focus": focus, "summary": summary})
+        summary["rounds"].append({"round": 1})
+    elif mode == "failure":
+        raise ValueError("specific worker failure")
+    elif mode == "interrupt":
+        if focus == "a.rs":
+            wait_for("second-started")
+        else:
+            started("second-started")
+            if not project.cancel_event.wait(10):
+                raise AssertionError("Other worker was not cancelled")
+            started("second-cancelled")
+        raise KeyboardInterrupt
+    elif mode in {"exit", "exit-dirty"}:
+        if focus == "a.rs":
+            if mode == "exit-dirty":
+                (project.workspace / "a.rs").write_bytes(b"interrupted overlay")
+            os._exit(17)
+        project.cancel_event.wait(10)
+        raise KeyboardInterrupt
+    elif mode == "backpressure":
+        for number in range(20):
+            progress("round", {"focus": focus, "payload": "x" * 300_000, "number": number})
+    return {
+        "focus": focus, "status": "frontend_clear", "stop_reason": "no_remaining_errors",
+        "observations": [], "rounds": [], "scope": [focus], "events": [],
+    }
+
+
+def fixture_worker(*args):
+    with mock.patch("verus_gap.parallel.probe", new=fixture_probe), mock.patch(
+        "verus_gap.source.Parser", side_effect=AssertionError("A worker reparsed its cached source"),
+    ):
+        worker_main(*args)
 
 
 class ParallelTests(unittest.TestCase):
@@ -41,6 +122,7 @@ class ParallelTests(unittest.TestCase):
         artifact.write_bytes(b"immutable dependency")
         manifest = {
             "rust_cfg": [], "root_source": "a.rs", "tool_sha256": {}, "workspace_restored": True,
+            "fixture_root": temporary, "parent_workspace": str(workspace),
         }
         return Project(
             output, workspace, workspace,
@@ -56,70 +138,53 @@ class ParallelTests(unittest.TestCase):
             for index, name in enumerate(names)
         ]
 
-    def result(self, focus):
+    def worker(self, project):
+        workers = Workers(project, 2, 2)
+        parent, child = workers.context.Pipe()
+        self.addCleanup(parent.close)
+        self.addCleanup(child.close)
+        with workers.cache.open("rb") as stream:
+            prepared = pickle.load(stream)
+        return workers, Worker(prepared, 0, workers.cancel, child, time.monotonic()), parent
+
+    def contexts(self, project):
         return {
-            "focus": focus, "status": "frontend_clear", "stop_reason": "no_remaining_errors",
-            "observations": [], "rounds": [], "scope": [focus], "events": [],
+            item.focus: json.loads((item.directory / "worker.json").read_text())
+            for item in self.work(project) if (item.directory / "worker.json").is_file()
         }
 
     def test_free_worker_takes_the_next_file_instead_of_a_fixed_partition(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            third_started, first_started = Event(), Event()
-            contexts = {}
-
-            def probing(worker, focus, directory, **options):
-                contexts[focus] = worker.workspace
-                if focus == "a.rs":
-                    first_started.set()
-                    self.assertTrue(third_started.wait(10))
-                elif focus == "b.rs":
-                    self.assertTrue(first_started.wait(10))
-                else:
-                    third_started.set()
-                return self.result(focus)
-
-            with mock.patch("verus_gap.parallel.probe", side_effect=probing):
+            project.manifest["fixture_mode"] = "dynamic"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
                 results = list(scan(project, self.work(project), 2, 2, mock.Mock(), mock.Mock()))
             self.assertEqual(len(results), 3)
+            contexts = self.contexts(project)
             self.assertEqual(contexts["b.rs"], contexts["c.rs"])
             self.assertNotEqual(contexts["a.rs"], contexts["b.rs"])
+            self.assertNotEqual(contexts["a.rs"]["pid"], os.getpid())
+            self.assertEqual(contexts["b.rs"]["pid"], contexts["c.rs"]["pid"])
+            self.assertNotEqual(contexts["a.rs"]["pid"], contexts["b.rs"]["pid"])
             self.assertTrue(project.manifest["workers_restored"])
             self.assertEqual(len(list((project.output / "workers").glob("*/worker-*/workspace"))), 2)
 
     def test_worker_sources_and_captured_paths_are_private_but_dependencies_are_shared(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            ready = [Event(), Event()]
-            observations = []
-            lock = Lock()
-
-            def probing(worker, focus, directory, **options):
-                index = 0 if focus == "a.rs" else 1
-                path = worker.workspace / "a.rs"
-                path.write_bytes(f"private {focus}".encode())
-                try:
-                    ready[index].set()
-                    self.assertTrue(ready[1 - index].wait(10))
-                    self.assertEqual(path.read_bytes(), f"private {focus}".encode())
-                    self.assertEqual((project.workspace / "a.rs").read_bytes(), project.sources["a.rs"].data)
-                    self.assertEqual(worker.cwd, worker.workspace)
-                    self.assertEqual(worker.env["CARGO_MANIFEST_DIR"], str(worker.workspace))
-                    self.assertEqual(worker.command[1], str(path))
-                    self.assertEqual(worker.command[3], project.command[3])
-                    self.assertEqual(worker.env["OUT_DIR"], project.env["OUT_DIR"])
-                    self.assertNotEqual(path.stat().st_ino, (project.workspace / "a.rs").stat().st_ino)
-                    with lock:
-                        observations.append(worker.sources["a.rs"])
-                finally:
-                    path.write_bytes(worker.sources["a.rs"].data)
-                return self.result(focus)
-
-            with mock.patch("verus_gap.parallel.probe", side_effect=probing):
+            project.manifest["fixture_mode"] = "isolation"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
                 list(scan(project, self.work(project, ("a.rs", "b.rs")), 32, 0, mock.Mock(), mock.Mock()))
-            self.assertEqual(len(observations), 2)
-            self.assertIsNot(observations[0], observations[1])
-            self.assertIsNot(observations[0], project.sources["a.rs"])
+            contexts = list(self.contexts(project).values())
+            self.assertEqual(len(contexts), 2)
+            self.assertNotEqual(contexts[0]["workspace"], contexts[1]["workspace"])
+            for context in contexts:
+                workspace = context["workspace"]
+                self.assertEqual(context["cwd"], workspace)
+                self.assertEqual(context["env"]["CARGO_MANIFEST_DIR"], workspace)
+                self.assertEqual(context["command"][1], str(Path(workspace) / "a.rs"))
+                self.assertEqual(context["command"][3], project.command[3])
+                self.assertEqual(context["env"]["OUT_DIR"], project.env["OUT_DIR"])
             self.assertEqual((project.output / "build/libdependency.rmeta").read_bytes(), b"immutable dependency")
             self.assertEqual(project.manifest["parallel_runs"][0]["jobs"], 2)
 
@@ -160,16 +225,30 @@ class ParallelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
 
-            def probing(worker, focus, directory, *, progress, **options):
-                summary = {"focus": focus, "rounds": [{"round": 0}]}
-                progress("round", {"focus": focus, "summary": summary})
-                summary["rounds"].append({"round": 1})
-                return self.result(focus)
-
+            project.manifest["fixture_mode"] = "snapshots"
             events = mock.Mock()
-            with mock.patch("verus_gap.parallel.probe", side_effect=probing):
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
                 list(scan(project, self.work(project, ("a.rs",)), 32, 2, mock.Mock(), events))
-            self.assertEqual(events.call_args.args[1]["summary"]["rounds"], [{"round": 0}])
+            rounds = [call.args[1] for call in events.call_args_list if call.args[0] == "round"]
+            self.assertEqual(rounds[0]["summary"]["rounds"], [{"round": 0}])
+
+    def test_source_models_are_serialized_once_and_processes_never_reparse_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            for source in project.sources.values():
+                source.render(set(), set())
+            original = Source.__getstate__
+            with mock.patch.object(Source, "__getstate__", autospec=True, side_effect=original) as serializing, mock.patch(
+                "verus_gap.parallel.worker_main", new=fixture_worker,
+            ):
+                list(scan(project, self.work(project), 3, 2, mock.Mock(), mock.Mock()))
+            self.assertEqual(serializing.call_count, len(project.sources))
+            self.assertEqual(project.manifest["parallel_runs"][0]["cached_sources"], len(project.sources))
+            self.assertEqual(project.manifest["parallel_runs"][0]["model"], "process")
+            for context in self.contexts(project).values():
+                self.assertEqual(
+                    context["source_identities"], {name: source.identity() for name, source in project.sources.items()},
+                )
 
     def test_prepared_absolute_and_relative_symlinks_resolve_inside_each_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -180,34 +259,34 @@ class ParallelTests(unittest.TestCase):
             (project.workspace / "generated/asset").write_text("generated input")
             (project.workspace / "absolute-dir").symlink_to(project.workspace / "generated", target_is_directory=True)
 
-            def probing(worker, focus, directory, **options):
-                for name in ("absolute.rs", "relative.rs"):
-                    self.assertEqual((worker.workspace / name).resolve(), worker.workspace / "a.rs")
-                self.assertEqual(
-                    (worker.workspace / "absolute-dir/asset").resolve(), worker.workspace / "generated/asset",
-                )
-                (worker.workspace / "absolute.rs").write_bytes(b"private overlay")
-                try:
-                    self.assertEqual((worker.workspace / "relative.rs").read_bytes(), b"private overlay")
-                    self.assertEqual((project.workspace / "a.rs").read_bytes(), project.sources["a.rs"].data)
-                finally:
-                    (worker.workspace / "a.rs").write_bytes(worker.sources["a.rs"].data)
-                return self.result(focus)
-
-            with mock.patch("verus_gap.parallel.probe", side_effect=probing):
-                list(scan(project, self.work(project, ("a.rs",)), 2, 2, mock.Mock(), mock.Mock()))
+            workers, worker, _ = self.worker(project)
+            context = worker.context()
+            for name in ("absolute.rs", "relative.rs"):
+                self.assertEqual((context.workspace / name).resolve(), context.workspace / "a.rs")
+            self.assertEqual(
+                (context.workspace / "absolute-dir/asset").resolve(), context.workspace / "generated/asset",
+            )
+            (context.workspace / "absolute.rs").write_bytes(b"private overlay")
+            try:
+                self.assertEqual((context.workspace / "relative.rs").read_bytes(), b"private overlay")
+                self.assertEqual((project.workspace / "a.rs").read_bytes(), project.sources["a.rs"].data)
+            finally:
+                (context.workspace / "a.rs").write_bytes(context.sources["a.rs"].data)
+            workers.verify()
 
     def test_copy_failure_never_publishes_a_frontier_or_starts_a_probe(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            with mock.patch("verus_gap.parallel.shutil.copytree", side_effect=OSError("copy failed")), mock.patch(
-                "verus_gap.parallel.probe",
-            ) as probing, self.assertRaisesRegex(GapError, "copy failed"):
+            project.workspace.rename(project.output / "missing-workspace")
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaisesRegex(
+                GapError, "No such file or directory",
+            ):
                 list(scan(project, self.work(project, ("a.rs",)), 2, 2, mock.Mock(), mock.Mock()))
-            probing.assert_not_called()
             self.assertEqual(list((project.output / "shards").rglob("report.json")), [])
             self.assertEqual(project.manifest["parallel_runs"][0]["created_workers"], 0)
-            self.assertIn("copy failed", next((project.output / "shards").rglob("worker-error.txt")).read_text())
+            self.assertIn(
+                "FileNotFoundError", next((project.output / "shards").rglob("worker-error.txt")).read_text(),
+            )
 
     def test_an_active_source_cannot_write_through_a_symlink_outside_its_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -216,26 +295,25 @@ class ParallelTests(unittest.TestCase):
             outside.write_bytes(project.sources["a.rs"].data)
             (project.workspace / "a.rs").unlink()
             (project.workspace / "a.rs").symlink_to(outside)
-            with mock.patch("verus_gap.parallel.probe") as probing, self.assertRaisesRegex(
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaisesRegex(
                 GapError, "Active source leaves the private scan workspace",
             ):
                 list(scan(project, self.work(project, ("a.rs",)), 2, 2, mock.Mock(), mock.Mock()))
-            probing.assert_not_called()
             self.assertEqual(outside.read_bytes(), project.sources["a.rs"].data)
             self.assertFalse(project.manifest["workers_restored"])
 
     def test_a_second_ctrl_c_during_shutdown_does_not_skip_worker_restoration(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            original = ThreadPoolExecutor.shutdown
+            original = Workers.shutdown
             handler = signal.getsignal(signal.SIGINT)
 
-            def shutdown(executor, *args, **kwargs):
+            def shutdown(workers):
                 signal.raise_signal(signal.SIGINT)
-                original(executor, *args, **kwargs)
+                original(workers)
 
-            with mock.patch("verus_gap.parallel.probe", side_effect=lambda p, f, d, **kw: self.result(f)), mock.patch(
-                "verus_gap.parallel.ThreadPoolExecutor.shutdown", autospec=True, side_effect=shutdown,
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), mock.patch.object(
+                Workers, "shutdown", new=shutdown,
             ):
                 list(scan(project, self.work(project, ("a.rs",)), 2, 2, mock.Mock(), mock.Mock()))
             self.assertTrue(project.manifest["workers_restored"])
@@ -253,7 +331,8 @@ class ParallelTests(unittest.TestCase):
     def test_worker_failure_stops_the_pool_and_retains_the_actual_traceback(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            with mock.patch("verus_gap.parallel.probe", side_effect=ValueError("specific worker failure")):
+            project.manifest["fixture_mode"] = "failure"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
                 with self.assertRaisesRegex(GapError, "specific worker failure"):
                     list(scan(project, self.work(project), 2, 2, mock.Mock(), mock.Mock()))
             logs = list((project.output / "shards").glob("*/worker-error.txt"))
@@ -264,24 +343,72 @@ class ParallelTests(unittest.TestCase):
     def test_interrupt_cancels_other_active_workers_and_does_not_dispatch_more_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
-            second_started, second_cancelled = Event(), Event()
-            started = []
-
-            def probing(worker, focus, directory, **options):
-                started.append(focus)
-                if focus == "a.rs":
-                    self.assertTrue(second_started.wait(10))
-                    raise KeyboardInterrupt
-                second_started.set()
-                self.assertTrue(worker.cancel_event.wait(10))
-                second_cancelled.set()
-                raise KeyboardInterrupt
-
-            with mock.patch("verus_gap.parallel.probe", side_effect=probing), self.assertRaises(KeyboardInterrupt):
+            project.manifest["fixture_mode"] = "interrupt"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaises(KeyboardInterrupt):
                 list(scan(project, self.work(project), 2, 2, mock.Mock(), mock.Mock()))
-            self.assertEqual(set(started), {"a.rs", "b.rs"})
-            self.assertTrue(second_cancelled.is_set())
+            self.assertEqual(set(self.contexts(project)), {"a.rs", "b.rs"})
+            self.assertTrue((Path(temporary) / "second-cancelled").is_file())
             self.assertTrue(project.manifest["workers_restored"])
+
+    def test_unexpected_process_exit_stops_and_reaps_the_other_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            project.manifest["fixture_mode"] = "exit"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaisesRegex(
+                GapError, "exited unexpectedly",
+            ):
+                list(scan(project, self.work(project), 2, 2, mock.Mock(), mock.Mock()))
+            run = project.manifest["parallel_runs"][0]
+            self.assertIn(17, run["worker_exit_codes"].values())
+            for pid in run["worker_pids"]:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+            self.assertNotIn("c.rs", self.contexts(project))
+            self.assertTrue(project.manifest["workers_restored"])
+
+    def test_cancellation_drains_large_ipc_messages_instead_of_blocking_process_exit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            project.manifest["fixture_mode"] = "backpressure"
+
+            def progress(phase, details):
+                if phase == "round":
+                    raise KeyboardInterrupt
+
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaises(KeyboardInterrupt):
+                list(scan(project, self.work(project), 2, 2, mock.Mock(), progress))
+            self.assertTrue(project.manifest["workers_restored"])
+            self.assertEqual(set(project.manifest["parallel_runs"][0]["worker_exit_codes"].values()), {0})
+
+    def test_forced_worker_death_never_claims_unrestored_sources_are_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            project.manifest["fixture_mode"] = "exit-dirty"
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaisesRegex(
+                GapError, "exited unexpectedly.*\\nWorker cleanup failed:.*not restored",
+            ):
+                list(scan(project, self.work(project), 2, 2, mock.Mock(), mock.Mock()))
+            self.assertFalse(project.manifest["workers_restored"])
+            self.assertFalse(project.manifest["parallel_runs"][0]["workspace_restored"])
+            for pid in project.manifest["parallel_runs"][0]["worker_pids"]:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_cancellation_during_initialization_stops_all_spawned_processes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+
+            def progress(phase, details):
+                if phase == "worker" and details["stage"] == "copy":
+                    raise KeyboardInterrupt
+
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker), self.assertRaises(KeyboardInterrupt):
+                list(scan(project, self.work(project), 2, 2, mock.Mock(), progress))
+            self.assertTrue(project.manifest["workers_restored"])
+            self.assertNotIn("c.rs", self.contexts(project))
+            for pid in project.manifest["parallel_runs"][0]["worker_pids"]:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
 
 class CancellationTests(unittest.TestCase):
@@ -415,6 +542,26 @@ class ParallelProgressTests(unittest.TestCase):
         return SimpleNamespace(
             output=output, manifest={"scan_level": 2}, save=mock.Mock(), verify_originals=mock.Mock(),
         )
+
+    def test_verbose_initialization_reports_process_readiness_without_counting_findings(self):
+        progress = VerboseProgress(["a.rs", "b.rs"], fast=True)
+        with mock.patch("verus_gap.cli.print") as printing:
+            progress("pool", {"jobs": 2})
+            for worker in (1, 2):
+                base = {"worker": worker, "jobs": 2, "pid": 100 + worker}
+                progress("worker", {**base, "stage": "models"})
+                progress("worker", {**base, "stage": "copy", "completed": 17})
+                progress("worker", {**base, "stage": "ready", "seconds": 0.7, "sources": 287})
+        output = "\n".join(call.args[0] for call in printing.call_args_list)
+        self.assertIn("process workers", output)
+        self.assertIn("dispatched files are not completed files", output)
+        self.assertIn("no reparsing", output)
+        self.assertIn("17 files copied", output)
+        self.assertIn("2/2 workers ready", output)
+        self.assertIn("287 cached source models reused", output)
+        self.assertTrue(all(call.kwargs["flush"] for call in printing.call_args_list))
+        self.assertEqual(progress.groups, set())
+        self.assertNotIn("[limitation]", output)
 
     def test_multiple_active_rounds_share_the_new_group_refresh_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -672,11 +819,13 @@ class RealParallelTests(unittest.TestCase):
                                 deadline = time.monotonic() + 5
                                 while time.monotonic() < deadline:
                                     children = []
-                                    for child_index in Path(f"/proc/{process.pid}/task").glob("*/children"):
-                                        try:
-                                            children.extend(int(pid) for pid in child_index.read_text().split())
-                                        except FileNotFoundError:
-                                            continue
+                                    manifest = json.loads((output / "project.json").read_text())
+                                    for worker in manifest["parallel_runs"][-1]["worker_pids"]:
+                                        for child_index in Path(f"/proc/{worker}/task").glob("*/children"):
+                                            try:
+                                                children.extend(int(pid) for pid in child_index.read_text().split())
+                                            except FileNotFoundError:
+                                                continue
                                     if len(children) >= 2:
                                         break
                                     time.sleep(0.01)

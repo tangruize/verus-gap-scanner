@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import pickle
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +13,77 @@ from verus_gap.source import Cfg, Edit, Source, apply_edits
 
 
 class SourceTests(unittest.TestCase):
+    def test_prepared_models_round_trip_without_parsing_or_rebuilding_the_index(self):
+        source = Source("lib.rs", (
+            'use ::core::arch;\n'
+            'const NAME: &str = "name";\n'
+            '#[cfg(windows)] pub fn inactive() { missing(); }\n'
+            'trait T { fn required(&self); fn defaulted(&self) {} }\n'
+            '#[cfg_attr(unix, inline)] pub fn active() { arch::asm!("nop"); }\n'
+        ).encode(), Cfg(["unix", "verus_keep_ghost"]))
+        expected = source.identity()
+        variants = [
+            ({}, {}),
+            ({"bodies": {source.functions[-1].id}}, {}),
+            ({"excluded": {source.declarations[1].id}}, {}),
+            ({}, {"prepare": False, "wrap": False}),
+            ({}, {"load_support": True, "support_crate": "support"}),
+            ({}, {"unwrapped": {source.functions[-1].id}}),
+        ]
+        rendered = [
+            source.render(state.get("bodies", set()), state.get("excluded", set()), **options)
+            for state, options in variants
+        ]
+        serialized = pickle.dumps(source, protocol=pickle.HIGHEST_PROTOCOL)
+        with mock.patch("verus_gap.source.Parser") as parsing, mock.patch.object(
+            Source, "_collect",
+        ) as collecting, mock.patch.object(Source, "_prepare") as preparing:
+            copied = pickle.loads(serialized)
+            self.assertEqual(copied.identity(), expected)
+            self.assertIsNone(copied._rendered)
+            self.assertIsNone(copied._render_key)
+            self.assertNotIn("tree", copied.__dict__)
+            for (state, options), original in zip(variants, rendered):
+                actual = copied.render(state.get("bodies", set()), state.get("excluded", set()), **options)
+                self.assertEqual(actual.data, original.data)
+                self.assertEqual(actual.overlay, original.overlay)
+                for segment in actual.segments:
+                    self.assertEqual(actual.location(segment.start), original.location(segment.start))
+            parsing.assert_not_called()
+            collecting.assert_not_called()
+            preparing.assert_not_called()
+
+    def test_transferred_models_have_independent_mutable_state_and_overlay_caches(self):
+        source = Source("lib.rs", b"#[inline] pub fn f() {}\n", Cfg(["unix"]))
+        original_render = source.render(set(), set())
+        serialized = pickle.dumps(source)
+        first, second = pickle.loads(serialized), pickle.loads(serialized)
+        self.assertIsNot(first.cfg, second.cfg)
+        self.assertIsNot(first.declarations[0], second.declarations[0])
+        first.cfg.values.add("windows")
+        first.declarations[0].attributes.append("#[external]")
+        first.preparation.append(Edit(0, 0, "// private\n", "private preparation"))
+        first.parse_errors.append({"kind": "private error"})
+        first.render({first.functions[0].id}, set())
+        self.assertEqual(second.cfg.values, source.cfg.values)
+        self.assertEqual(second.declarations, source.declarations)
+        self.assertEqual(second.preparation, source.preparation)
+        self.assertEqual(second.parse_errors, source.parse_errors)
+        self.assertIsNone(second._rendered)
+        self.assertEqual(second.render(set(), set()).data, original_render.data)
+        self.assertIs(source.render(set(), set()), original_render)
+
+    def test_transferred_syntax_tree_is_lazy_and_process_local(self):
+        from verus_gap.source import Parser
+
+        source = Source("lib.rs", b"pub fn f() {}\n", Cfg([]))
+        copied = pickle.loads(pickle.dumps(source))
+        with mock.patch("verus_gap.source.Parser", wraps=Parser) as parsing:
+            self.assertEqual(str(copied.tree.root_node), str(source.tree.root_node))
+            self.assertIsNot(copied.tree, source.tree)
+            self.assertIs(copied.tree, copied.tree)
+            parsing.assert_called_once()
+
     def test_render_cache_reuses_only_the_same_complete_overlay(self):
         original = b"pub fn f() { let _ = 1; }\n"
         source = Source("lib.rs", original, Cfg([]))

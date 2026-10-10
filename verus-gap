@@ -18,4 +18,5 @@ except ModuleNotFoundError as error:
     print("error: Scanner dependencies are missing. Run ./setup once, then retry.", file=sys.stderr)
     raise SystemExit(2)
 
-raise SystemExit(main())
+if __name__ == "__main__":
+    raise SystemExit(main())

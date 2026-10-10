@@ -10,7 +10,7 @@ import re
 from dataclasses import asdict, dataclass
 from functools import cached_property
 
-from tree_sitter import Language, Node, Parser
+from tree_sitter import Language, Node, Parser, Tree
 import tree_sitter_rust
 
 from .gap import GapError, prefix_end
@@ -249,7 +249,6 @@ class Source:
     def __init__(self, file: str, data: bytes, cfg: Cfg):
         self.file, self.data, self.cfg = file, data, cfg
         self.text = data.decode("utf-8")
-        self.tree = Parser(LANGUAGE).parse(data)
         self.declarations: list[Declaration] = []
         self.preparation: list[Edit] = []
         self.parse_errors: list[dict] = []
@@ -257,6 +256,22 @@ class Source:
         self._prepare(self.tree.root_node)
         self._render_key: tuple | None = None
         self._rendered: Rendered | None = None
+
+    @cached_property
+    def tree(self) -> Tree:
+        return Parser(LANGUAGE).parse(self.data)
+
+    def __getstate__(self) -> dict:
+        # Transfer the prepared model, not process-local trees or overlay caches.
+        return {
+            key: value for key, value in self.__dict__.items()
+            if key not in {"tree", "_render_key", "_rendered"}
+        }
+
+    def __setstate__(self, state: dict):
+        self.__dict__.update(state)
+        self._render_key = None
+        self._rendered = None
 
     def _text(self, node: Node | None) -> str:
         return self.data[node.start_byte:node.end_byte].decode("utf-8") if node else ""

@@ -15,6 +15,7 @@ import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
+from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 from threading import Event
 
@@ -45,7 +46,7 @@ def capture_wrapper(output: Path) -> Path:
 
 
 def run(command: list[str], cwd: Path, env: dict[str, str], timeout: float,
-        *, cancel_event: Event | None = None) -> dict:
+        *, cancel_event: Event | ProcessEvent | None = None) -> dict:
     if cancel_event is not None and cancel_event.is_set():
         raise KeyboardInterrupt
     if timeout <= 0:
