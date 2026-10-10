@@ -26,6 +26,18 @@ Reproduce before altering the case. Match Verus/Rust versions, edition, target, 
 
 Keep the diagnosis unresolved when required controls are missing. Warnings alone are not support gaps.
 
+## Repair missing build context with a configuration
+
+When default setup fails, first distinguish Cargo metadata, unchanged-Rust compilation, preparation, and target/support setup failures. Read the actual failing command and complete output; do not try to cure an unsupported Rust/Verus construct with build flags. Configuration syntax, selection, and commands are in README's optional build configuration section.
+
+1. Recover the project's documented native build recipe from its README, `.cargo/config.toml`, manifests, Makefile/CI commands, target JSON, and relevant build scripts. Identify the intended package, target, features, Rust flags, environment, and generated assets. Do not assume host compilation, enable `full` automatically, or choose arbitrary platform/memory defaults.
+2. Reproduce that recipe in an authorized copy with Verus's matching Rust. Separate missing configuration from toolchain incompatibility, missing system tools/assets, and actual source errors. A configuration only supplies build settings; it must not install tools, execute setup scripts, or weaken checks.
+3. Translate only demonstrated missing settings into a TOML configuration. Use Cargo's existing configuration where sufficient; keep Cargo arguments tokenized, append required Rust flags, and preserve existing environment values unless a justified forced value is needed. Never put credentials or scanner-controlled toolchain/wrapper settings in the file.
+4. Add narrow matching conditions from Cargo package metadata and distinctive required workspace files. Do not use local directory names, transient branches, or Git remotes as identity. Check the conditions against a different package or missing marker so the recipe cannot apply broadly by accident.
+5. Select the candidate explicitly and require the unchanged Rust build, ordinary-Rust preparation control, and target/support smoke checks to pass before accepting application findings. Retain the before/after commands, effective configuration, and raw evidence. If a profile will be bundled, also check automatic selection and its printed notice; keep its matching data in TOML, not repository-specific Python branches.
+
+Escalate unresolved build requirements instead of repeatedly adding speculative flags. Report which setup stage is still blocked and whether the native recipe itself works with the matching Rust. Do not call a successful setup a proof or complete inventory. Follow authorization and privacy rules before committing or sharing a project profile.
+
 ## Trace and minimize
 
 Use the matching Verus release's source. For language errors, locate the diagnostic site and inspect the missing case and supported neighbors. For models, follow API/type/trait resolution through specification bounds, cfg, and registration. Trace the responsible translation/checking layer using the [source layout](https://github.com/verus-lang/verus/blob/main/source/CODE.md), and identify the missing semantic rule or violated invariant.

@@ -282,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
         if any(option == "--jobs" or option.startswith("--jobs=") for option in options):
             print("error: --jobs is an adaptive scan option; do not combine it with --frontier.", file=sys.stderr)
             return 2
+        if any(
+            option in {"--config", "--no-config"} or option.startswith("--config=")
+            for option in options
+        ):
+            print("error: Build configurations are adaptive scan options; do not combine them with --frontier.", file=sys.stderr)
+            return 2
         values.remove("--frontier")
         from .gap import main as frontier
         return frontier(values)
@@ -294,7 +300,11 @@ def main(argv: list[str] | None = None) -> int:
         epilog="Use 'verus-gap report RESULT_DIR' to refresh saved reports without scanning.",
     )
     parser.add_argument("path", nargs="?", default=".", help="crate directory, Cargo.toml, or .rs file")
-    parser.add_argument("--features", help="Cargo features (full is automatically used when the crate defines it)")
+    parser.add_argument("--features", help="Cargo features (otherwise keep Cargo or selected configuration defaults)")
+    configuration = parser.add_mutually_exclusive_group()
+    configuration.add_argument("--config", help="explicit TOML build configuration; overrides automatic selection")
+    configuration.add_argument("--no-config", action="store_true",
+                               help="disable project and bundled build configurations; keep Cargo defaults")
     parser.add_argument("--package", help="crate name when the workspace is ambiguous")
     parser.add_argument("--bin", help="binary target when there is no unique library")
     parser.add_argument("--file", action="append", default=[], help="file or glob relative to workspace or crate")
@@ -323,7 +333,9 @@ def main(argv: list[str] | None = None) -> int:
         args.standalone = True
     if args.resume and args.out:
         parser.error("--resume reuses its result directory; do not also pass --out")
-    if args.resume and (args.features or cargo or args.package or args.bin or args.verus):
+    if args.resume and (
+        args.features or cargo or args.package or args.bin or args.verus or args.config or args.no_config
+    ):
         parser.error("A resumed scan keeps its original compiler/build context; start a new scan to change it.")
     output = Path(args.resume or args.out).expanduser().resolve() if args.resume or args.out else (
         Path.cwd() / "verus-gap-results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%fZ")

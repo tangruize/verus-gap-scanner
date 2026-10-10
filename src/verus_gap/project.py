@@ -13,6 +13,10 @@ from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
 from threading import Event
 
+from .configuration import (
+    CONFIGURATION_HELP, automatic_configuration, load_configuration, merge_cargo_arguments,
+    validate_cargo_arguments, validate_saved_configuration, workspace_configuration,
+)
 from .gap import (
     GapError, PACKAGE, active_sources, discover_manifest, find_verus, identity,
     metadata, run, save_run, select_package, select_target, snapshot, verus_args,
@@ -106,6 +110,10 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     env = dict(os.environ, RUSTUP_TOOLCHAIN=version["toolchain"], CARGO_BUILD_JOBS="4")
     for key in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_MAKEFLAGS"):
         env.pop(key, None)
+    configuration = load_configuration(Path(args.config)) if getattr(args, "config", None) else None
+    if configuration is not None:
+        configuration.apply_environment(env)
+    automatic = not getattr(args, "no_config", False)
     standalone = path.suffix == ".rs"
     ghost_dependencies = False
     manifest_path = None
@@ -118,35 +126,48 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     if standalone:
         source_root, root = path.parent, path
         package, target = None, None
+        if configuration is not None and (
+            configuration.package or configuration.binary or configuration.arguments or configuration.rustflags
+        ):
+            raise GapError("Cargo build settings require a Cargo project, not a standalone .rs file.")
     else:
         manifest_path = manifest_path or discover_manifest(path)
-        meta = metadata(manifest_path, env, deadline - time.monotonic())
-        package = select_package(meta, manifest_path, args.package)
+        try:
+            meta = metadata(manifest_path, env, deadline - time.monotonic())
+        except GapError as error:
+            raise GapError(f"{error}\n{CONFIGURATION_HELP}") from error
+        source_root = Path(meta["workspace_root"]).resolve()
+        if configuration is None and automatic:
+            configuration = workspace_configuration(source_root)
+            if configuration is not None and configuration.match is not None and not any(
+                member["id"] in meta["workspace_members"]
+                and configuration.match.applies(member, source_root)
+                for member in meta["packages"]
+            ):
+                configuration = None
+        configured_package = configuration.package if configuration is not None and not any(
+            member["id"] in meta["workspace_members"]
+            and Path(member["manifest_path"]) == manifest_path
+            for member in meta["packages"]
+        ) else None
+        package = select_package(
+            meta, manifest_path, args.package or configured_package,
+        )
+        if configuration is not None and configuration.selection == "workspace" and (
+            configuration.match is not None and not configuration.match.applies(package, source_root)
+        ):
+            configuration = None
+        if configuration is None and automatic:
+            configuration = automatic_configuration(source_root, package)
+        if configuration is not None and configuration.selection != "explicit":
+            configuration.apply_environment(env)
         from .dependencies import requires_ghost_dependencies
         ghost_dependencies = requires_ghost_dependencies(package, meta)
-        target = select_target(package, args.bin)
-        source_root = Path(meta["workspace_root"]).resolve()
+        target = select_target(package, args.bin or (configuration.binary if configuration else None))
         root = Path(target["src_path"]).resolve()
-        if "full" in package.get("features", {}) and not any(
-            arg == "--features" or arg.startswith("--features=") or arg == "--no-default-features"
-            for arg in cargo_args
-        ):
-            cargo_args = [*cargo_args, "--features", "full"]
-            print("Using the crate's full feature set for the compatibility scan.", flush=True)
-        kernel_target = source_root / "build/targets/x86-kernel.json"
-        if package["name"] == "kernel" and kernel_target.is_file() and not any(
-            arg == "--target" or arg.startswith("--target=") for arg in cargo_args
-        ):
-            env["RUSTC_BOOTSTRAP"] = "1"
-            env.setdefault("MEMORY_SIZE_BYTES", "268435456")
-            env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " -C relocation-model=static -C prefer-dynamic=no").strip()
-            cargo_args = [
-                *cargo_args, "--no-default-features", "--features", "microvm,trace",
-                "-Zbuild-std=core,alloc,compiler_builtins",
-                "-Zbuild-std-features=compiler-builtins-mem", "-Zjson-target-spec",
-                "--target", "build/targets/x86-kernel.json",
-            ]
-            print("Using Nanvix's actual x86-kernel target with a matching rebuilt standard library.", flush=True)
+        validate_cargo_arguments(cargo_args)
+        if configuration is not None:
+            cargo_args = merge_cargo_arguments(configuration.arguments, cargo_args)
         for member in meta["packages"]:
             for dependency in member["dependencies"]:
                 if dependency.get("path") and not Path(dependency["path"]).resolve().is_relative_to(source_root):
@@ -154,6 +175,10 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
                         f"Path dependency {dependency['name']} is outside the workspace. "
                         "Use a self-contained project copy, or let an agent prepare one."
                     )
+    if configuration is not None:
+        configuration.check(package, source_root)
+        print(f"Using build configuration: {configuration.path} ({configuration.selection}).", flush=True)
+    configured = configuration.save(output, env) if configuration is not None else None
     if source_root in {Path.home(), Path(source_root.anchor)}:
         raise GapError("Refusing to copy a filesystem or home root.")
     workspace = output / "workspace"
@@ -168,6 +193,7 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         "target": target["name"] if target else root.stem,
         "manifest_relative": str(manifest_path.relative_to(source_root)) if manifest_path else None,
         "ghost_dependencies_required": ghost_dependencies,
+        "build_configuration": configured,
         "scan_level": getattr(args, "scan_level", DEFAULT_SCAN_LEVEL),
         "cargo_args": cargo_args, "source_sha256": hashes,
         "verus": version, "verus_executable": str(verus),
@@ -203,14 +229,6 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         (output / "build").mkdir()
         baseline_env = env
     else:
-        reserved = {
-            "--manifest-path", "--target-dir", "--package", "-p", "--workspace", "--all",
-            "--lib", "--bin", "--bins", "--example", "--examples", "--test", "--tests",
-            "--bench", "--benches", "--all-targets",
-        }
-        for arg in cargo_args:
-            if arg.split("=", 1)[0] in reserved or arg.startswith("-p") and arg != "--profile":
-                raise GapError(f"Cargo target override {arg}: select the crate with --package or --bin instead.")
         baseline_env = dict(
             env, CARGO_TARGET_DIR=str(output / "build"), CARGO_INCREMENTAL="0",
             RUSTC_WRAPPER=str(capture_wrapper(output)), RUSTC_WORKSPACE_WRAPPER="",
@@ -239,7 +257,8 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     if baseline["exit_code"] or baseline["timed_out"]:
         raise GapError(
             "The unchanged Rust build failed; no Verus limitation was inferred. "
-            "See baseline.stdout and baseline.stderr for the actual build error."
+            "See baseline.stdout and baseline.stderr for the actual build error.\n"
+            + CONFIGURATION_HELP
         )
     record["baseline_passed"] = True
     write_json(output / "project.json", record)
@@ -352,13 +371,17 @@ def check_preparation(project: Project):
 
 
 def save_replay(project: Project):
+    configuration = project.manifest.get("build_configuration") or {}
+    recorded = set(project.manifest.get("replay_environment_keys", [])) | set(
+        configuration.get("environment", {})
+    )
     write_json(project.output / "replay.json", {
         "cwd": str(project.cwd), "command": project.command,
         "environment": {
             key: value for key, value in project.env.items()
             if (key.startswith(("CARGO_", "DEP_")) or "__VERUS_DRIVER_" in key or key in {
-                "OUT_DIR", "RUSTUP_TOOLCHAIN", "RUSTC_BOOTSTRAP", "MEMORY_SIZE_BYTES", "RUST_MIN_STACK",
-            }) and not any(part in key for part in ("TOKEN", "PASSWORD", "SECRET", "CREDENTIAL"))
+                "OUT_DIR", "RUSTUP_TOOLCHAIN", "RUSTC_BOOTSTRAP", "RUST_MIN_STACK",
+            } or key in recorded) and not any(part in key.upper() for part in ("TOKEN", "PASSWORD", "SECRET", "CREDENTIAL"))
             and key != "CARGO_MAKEFLAGS"
         },
     })
@@ -368,7 +391,14 @@ def resume(output: Path, timeout: float) -> Project:
     record = json.loads((output / "project.json").read_text())
     if record["schema"] != "verus-gap/project-v2" or not record["baseline_passed"]:
         raise GapError("This result does not contain a successful reusable Rust baseline.")
+    validate_saved_configuration(output, record.get("build_configuration"))
     replay = json.loads((output / "replay.json").read_text())
+    configuration = record.get("build_configuration")
+    if configuration is not None and any(
+        replay["environment"].get(key) != value for key, value in configuration["environment"].items()
+    ):
+        raise GapError("The saved replay no longer matches its build configuration environment.")
+    record["replay_environment_keys"] = sorted(replay["environment"])
     verus = Path(record["verus_executable"])
     if identity(verus) != record["verus"]:
         raise GapError("The Verus installation changed; start a new scan instead of mixing compiler versions.")
@@ -452,5 +482,7 @@ def resume(output: Path, timeout: float) -> Project:
         if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
             raise GapError(f"Captured dependency artifact changed: {name}.")
     project.verify_originals()
+    if configuration is not None:
+        print(f"Reusing saved build configuration: {configuration['path']}.", flush=True)
     print("Reusing the unchanged Rust build and captured dependencies.", flush=True)
     return project

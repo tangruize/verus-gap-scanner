@@ -21,4 +21,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-verus_gap = ["examples/*.rs"]
+verus_gap = ["examples/*.rs", "profiles/*.toml"]

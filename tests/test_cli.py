@@ -172,6 +172,45 @@ class ScanLevelTests(unittest.TestCase):
             self.assertEqual(project_path.read_bytes(), before)
             self.assertEqual(report_path.read_text(), "original evidence")
 
+    def test_configuration_options_are_mutually_exclusive_and_cannot_change_a_resume(self):
+        cases = [
+            ["--config", "recipe.toml", "--no-config"],
+            ["--resume", "results", "--config", "recipe.toml"],
+            ["--resume", "results", "--no-config"],
+        ]
+        for options in cases:
+            with self.subTest(options=options), mock.patch("verus_gap.cli.prepare") as preparing, mock.patch(
+                "verus_gap.cli.resume",
+            ) as resuming, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+                main(options)
+            self.assertEqual(failure.exception.code, 2)
+            preparing.assert_not_called()
+            resuming.assert_not_called()
+
+    def test_configuration_options_reach_preparation_without_entering_cargo_arguments(self):
+        cases = [
+            (["--config", "recipe.toml"], "recipe.toml", False),
+            (["--no-config"], None, True),
+        ]
+        for options, path, disabled in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory, mock.patch(
+                "verus_gap.cli.prepare", side_effect=GapError("fixture stop"),
+            ) as preparing, redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["crate", "--out", directory, *options]), 2)
+                args, cargo, output = preparing.call_args.args
+                self.assertEqual(args.config, path)
+                self.assertEqual(args.no_config, disabled)
+                self.assertEqual(cargo, [])
+
+    def test_build_configuration_options_are_not_legacy_frontier_options(self):
+        for options in (["--config", "recipe.toml"], ["--config=recipe.toml"], ["--no-config"]):
+            with self.subTest(options=options), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(main(["--frontier", *options]), 2)
+                self.assertIn("do not combine", errors.getvalue())
+        with mock.patch("verus_gap.gap.main", return_value=0) as frontier:
+            self.assertEqual(main(["--frontier", "--", "--config", "build.target=example"]), 0)
+            frontier.assert_called_once_with(["--", "--config", "build.target=example"])
+
 
 class VerboseProgressTests(unittest.TestCase):
     def record(self, file="selected.rs", message="Verus does not support example", **changes):

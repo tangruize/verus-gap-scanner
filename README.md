@@ -18,10 +18,10 @@ Try Tokio after setup, choosing an unused clone destination:
 
 ```bash
 git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap"
-./verus-gap "$HOME/tokio-verus-gap/tokio" --jobs 32 --verbose
+./verus-gap "$HOME/tokio-verus-gap/tokio" --features full --jobs 32 --verbose
 ```
 
-This selects the Tokio library crate, enables its `full` feature, and shows live progress. **Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
+This selects the Tokio library crate, explicitly enables its `full` feature, and shows live progress. **Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
 
 For your own crate:
 
@@ -41,7 +41,7 @@ The sections below are reference material for custom scopes, deeper investigatio
 
 ### Select sources and Cargo options
 
-The scanner discovers Cargo, builds unchanged code with Verus's matching Rust, and scans active source. A crate-defined `full` feature is selected automatically unless you choose features explicitly; otherwise Cargo's default features are retained.
+The scanner discovers Cargo, builds unchanged code with Verus's matching Rust, and scans active source. Cargo's default features and build configuration are retained unless you choose options explicitly or a build configuration below is selected. Defining a `full` feature does not automatically enable it.
 
 A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**, target, generated files, or build options. It is not treated as a dependency-free snippet. A standalone `.rs` file works too. Use `--package NAME` for an ambiguous workspace, `--bin NAME` for a specific binary, and repeat `--file RELATIVE_PATH_OR_GLOB` to select files. Choose features with `--features FEATURE`, or pass normal Cargo options after `--`.
 
@@ -51,6 +51,49 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 ```
 
 For a small built-in check, run `./verus-gap demo`. It intentionally reports missing `std::time::Instant` models and exits 1.
+
+### Optional build configuration
+
+**Use a configuration only when the project needs build settings that ordinary Cargo defaults do not supply**, such as Makefile-provided features, a custom target, `build-std` options, or build-script environment variables. An unchanged-Rust setup failure is not a Verus gap. Read the actual metadata/build error and `baseline.stdout` / `baseline.stderr` first; a configuration cannot repair invalid Rust, missing tools/assets, or an unsupported Verus construct.
+
+Most projects need no extra file. Existing `.cargo/config.toml` settings are used by Cargo normally. The scanner prints every extra configuration it selects, using this order:
+
+| Selection | Behavior |
+|---|---|
+| `--no-config` | Disable workspace and bundled scanner configurations; retain Cargo's own settings and explicit options |
+| `--config PATH` | Load this TOML file instead of automatic selection; validate any declared matching conditions |
+| Workspace `verus-gap.toml` | Load this optional file from the Cargo workspace root if any declared matching conditions apply |
+| Bundled profile | Select only a profile whose declared conditions all match the selected Cargo package and workspace files |
+| No match | Continue with ordinary Cargo defaults and explicit options |
+
+`--config` and `--no-config` are mutually exclusive. Ambiguous or invalid configurations fail explicitly, rather than picking one or falling back silently. If neither Cargo nor a configuration selects a unique workspace package, use `--package` or a crate path.
+
+The bundled [Nanvix kernel profile](src/verus_gap/profiles/nanvix.toml) matches the Cargo package name, its declared homepage, and two required workspace files. It selects the x86 kernel with `microvm,trace`, matching standard-library build options, and a 256 MiB memory default that an existing environment value can override. It does **not** inspect Git remotes, contact GitHub, or rely on the checkout's directory name, so a fork or source copy can match. This is one explicit build recipe, not automatic discovery of every platform choice or guaranteed compatibility with future project versions.
+
+```bash
+./verus-gap /path/to/crate --config /path/to/custom.toml --jobs 32 --verbose
+./verus-gap /path/to/crate --no-config --jobs 32 --verbose
+```
+
+A minimal custom file is:
+
+```toml
+version = 1
+
+[cargo]
+args = ["--features", "backend_a"]
+
+[env]
+PROJECT_MODE = "test"
+```
+
+Optional `cargo.package` and `cargo.bin` provide crate/binary defaults; an explicit crate path or command-line selector takes precedence. A workspace configuration for another selected package is not applied. `cargo.args` is an array of Cargo argument tokens, not a shell command. Explicit target, feature-selection, or profile options replace the corresponding configured defaults; other Cargo arguments are appended and retain Cargo's normal semantics. Use the dedicated package/bin fields instead of putting scanner-owned selection/output flags in `cargo.args`.
+
+Optional `cargo.rustflags` is an array of rustc flag tokens appended to inherited flags, including `CARGO_ENCODED_RUSTFLAGS` when present. An `env` string supplies a default without replacing an existing environment value; use `{ value = "required-value", force = true }` when replacement is genuinely required. Toolchain/wrapper/output controls and Cargo-generated package metadata are managed by the scanner/Cargo. Keep credentials out of configurations; supply them through the normal shell/Cargo environment.
+
+An optional `[match]` table can require `package`, exact Cargo-metadata `homepage` and/or `repository` values, and `files` that must exist. A matching table requires a package plus at least one additional condition; all conditions are ANDed. `repository` means the manifest's metadata, not a Git remote. File conditions and relative Cargo target paths are relative to the **Cargo workspace root**, even when the configuration is stored elsewhere. Strings are not shell-expanded.
+
+The selected TOML is retained as `build-config.toml`, with its source path, hash, selection mode, and effective configured environment in `project.json`; replay includes that environment. Resume reuses the saved configuration and compiler context, without re-detecting profiles or requiring the original configuration file. Start a new scan to change the configuration. Saved-report refresh also validates the retained configuration.
 
 ### Choose a scan level
 
@@ -89,6 +132,7 @@ Locations link to unchanged files under `originals/`, with visible line/column n
 | `report.md` / `report.json` | Reproduced gaps, source scope, coverage, and remaining file frontiers |
 | `review.md` | Optional diagnostics for checking boundaries, migration work, setup/preparation problems, and compiler failures |
 | `project.json` / `replay.json` | Build configuration, toolchain/dependency identities, adaptations, and replay commands |
+| `build-config.toml` | Exact optional scanner configuration selected for this run, when one was used |
 | `originals/` / `shards/` | Unchanged sources and every round's raw output, source overlay, edits, and confirmation evidence |
 | `workers/` | Private concurrent scan copies and their replay context |
 | `agent-tasks.json` | Generated per-file blocker hints, not diagnoses of individual gaps |

@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from verus_gap.configuration import load_configuration
+from verus_gap.gap import GapError
 from verus_gap.project import write_json
 from verus_gap.report import (
     MUTABLE_STATIC_ACCESS, aggregate, atomic_text, group_key, language_family, main, markdown,
@@ -107,6 +109,24 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(report["counts"]["library_specification"], 1)
             self.assertEqual(report["scan_progress"]["state"], "incomplete")
             self.assertEqual(report["scan_progress"]["active_file"], shard["focus"])
+
+    def test_manual_refresh_retains_configuration_without_its_input_file_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, _, _ = self.saved_result(temporary)
+            path = Path(temporary) / "recipe.toml"
+            path.write_text('version=1\n[env]\nBUILD_MODE="configured"\n')
+            configuration = load_configuration(path)
+            manifest["build_configuration"] = configuration.save(output, {"BUILD_MODE": "configured"})
+            write_json(output / "project.json", manifest)
+            path.unlink()
+            report = refresh_report(output)
+            self.assertEqual(report["build_configuration"], manifest["build_configuration"])
+            self.assertIn("[saved TOML](build-config.toml)", (output / "report.md").read_text())
+            before = (output / "report.md").read_bytes()
+            (output / "build-config.toml").write_text('version=1\n[env]\nBUILD_MODE="changed"\n')
+            with self.assertRaisesRegex(GapError, "saved build configuration changed"):
+                refresh_report(output)
+            self.assertEqual((output / "report.md").read_bytes(), before)
 
     def test_manual_refresh_before_the_first_checkpoint_retains_pending_files(self):
         with tempfile.TemporaryDirectory() as temporary:

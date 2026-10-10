@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from .configuration import validate_saved_configuration
 from .engine import canonical
 from .gap import GapError
 from .project import Project, scan_level_from
@@ -190,6 +191,7 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
         "package": project.manifest["package"], "verus": project.manifest["verus"],
         "baseline_passed": project.manifest["baseline_passed"],
         "cargo_args": project.manifest["cargo_args"], "complete_inventory": False,
+        "build_configuration": project.manifest.get("build_configuration"),
         "checks": project.manifest["checks"],
         "support_mode": project.manifest.get("support_mode"),
         "jobs": project.manifest.get("jobs", 1),
@@ -370,6 +372,11 @@ def markdown(report: dict) -> str:
         f"**Crate:** `{report['package']}`; **Verus:** `{report['verus']['version']}`.",
         f"**Unchanged Rust build:** {'passed' if report['baseline_passed'] else 'failed'}. "
         f"**Cargo configuration:** `{' '.join(report['cargo_args']) or 'default features'}`.", "",
+        *([
+            f"**Build configuration:** `{Path(report['build_configuration']['path']).name}` "
+            f"(`{report['build_configuration']['selection']}`); "
+            f"[saved TOML]({report['build_configuration']['snapshot']}).", "",
+        ] if report.get("build_configuration") else []),
         *([
             f"**Scan level: {level}{' (fast)' if level == 2 else ''}, selected source only.** The native Cargo context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
         ] if fast else [
@@ -695,6 +702,7 @@ def _refresh_report(output: Path) -> dict:
         raise GapError("The saved worker count is invalid.")
     if "workers_restored" in manifest and type(manifest["workers_restored"]) is not bool:
         raise GapError("The saved worker restoration state is invalid.")
+    validate_saved_configuration(output, manifest.get("build_configuration"))
     cfg = Cfg([*manifest["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
     sources = {}
     for name, identity in active.items():

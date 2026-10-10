@@ -1,0 +1,22 @@
+version = 1
+
+[match]
+package = "kernel"
+homepage = "https://github.com/nanvix"
+files = ["build/targets/x86-kernel.json", "build/kernel_config.toml"]
+
+[cargo]
+package = "kernel"
+args = [
+    "--no-default-features",
+    "--features", "microvm,trace",
+    "-Zbuild-std=core,alloc,compiler_builtins",
+    "-Zbuild-std-features=compiler-builtins-mem",
+    "-Zjson-target-spec",
+    "--target", "build/targets/x86-kernel.json",
+]
+rustflags = ["-C", "relocation-model=static", "-C", "prefer-dynamic=no"]
+
+[env]
+RUSTC_BOOTSTRAP = { value = "1", force = true }
+MEMORY_SIZE_BYTES = "268435456"
