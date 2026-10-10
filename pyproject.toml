@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verus-gap"
+version = "0.2.0"
+description = "Adaptive, source-bound Verus compatibility inventory for Rust projects"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["tree-sitter>=0.25,<0.26", "tree-sitter-rust>=0.24,<0.25", "tomlkit>=0.13,<0.14"]
+
+[project.scripts]
+verus-gap = "verus_gap.cli:main"
+verus-gap-setup = "verus_gap.setup_verus:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+verus_gap = ["examples/*.rs"]

@@ -1,0 +1,7 @@
+.tools/
+.venv/
+verus-gap-results/
+__pycache__/
+*.egg-info/
+build/
+dist/

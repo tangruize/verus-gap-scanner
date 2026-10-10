@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent
+venv = root / ".venv"
+if (venv / "bin/python").is_file() and Path(sys.prefix).resolve() != venv:
+    os.execv(str(venv / "bin/python"), [str(venv / "bin/python"), *sys.argv])
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(root / "src"))
+
+try:
+    from verus_gap.cli import main
+except ModuleNotFoundError as error:
+    if error.name not in {"tree_sitter", "tree_sitter_rust", "tomlkit"}:
+        raise
+    print("error: Scanner dependencies are missing. Run ./setup once, then retry.", file=sys.stderr)
+    raise SystemExit(2)
+
+raise SystemExit(main())
