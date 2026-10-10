@@ -23,7 +23,7 @@ git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap
 ./verus-gap "$HOME/tokio-verus-gap/tokio" --jobs 32 --verbose
 ```
 
-This selects the Tokio library crate inside the cloned workspace, enables its `full` feature, and scans with live progress and up to 32 concurrent file workers. **Scan level 2 is the default and the recommended first pass**; no level option is needed. The clone follows Tokio's default branch, so its findings can differ from the measured examples below.
+This selects the Tokio library crate inside the cloned workspace, enables its `full` feature, and scans with live progress and up to 32 concurrent file workers. **Scan level 2 is the default and the recommended first pass**; no level option is needed.
 
 For your own project or a small built-in example:
 
@@ -43,7 +43,7 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 
 ## Choose a scan level
 
-**Keep the default level 2 for a normal gap inventory.** Levels 1 and 0 are not recommended for routine first-pass scans: they spend more time exploring checking obstacles and can add relatively few findings. Use them when you specifically need deeper selected-source investigation or dependency findings.
+**Keep the default level 2 for a normal gap inventory.** Levels 1 and 0 spend additional time exploring checking obstacles; use them only when you specifically need deeper selected-source investigation or dependency findings.
 
 | Level | What it does | When to choose it |
 |---|---|---|
@@ -51,16 +51,7 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 | `1` | Stay in selected source and continue working around checking boundaries | Investigate gaps that may be hidden behind a boundary |
 | `0` | Also investigate resolvable local dependencies needed to continue checking | Include dependency findings, labeled separately |
 
-Recorded serial comparisons show the time/retention tradeoff:
-
-| Selected input and reference | Level-2 time saved | Confirmed groups retained | Primary group/location records retained |
-|---|---|---|---|
-| Tokio mutex, compared with level 1 | **65.2%** whole-command time: 84.4 to 29.4 s | **100%** (15/15) | **100%** (39/39) |
-| Base64, compared with a dependency-expanding reference | **83.6%** summed compiler time: 262.8 to 43.2 s | **97.3%** (71/73) | **92.2%** (106/115) |
-
-A full-Tokio level-2 scan retained **100% of the 560 known reference groups**: 22 language groups and 538 library/API-model groups. Groups are distinct diagnostic families or named APIs, not distinct Rust features; a primary group/location record pairs a group with an original source coordinate. These percentages measure retention of observed reference findings, **not exhaustive coverage of every gap**.
-
-The mutex comparison holds source, dependency lock, compiler, and scanner revision fixed; see [validation](VALIDATION.md#scan-levels). Base64 and full-Tokio reference comparisons use different scanner revisions, so they are not same-revision level-only benchmarks. Base64's time figure excludes setup and Python/report overhead. Shared-host measurements are examples, not guaranteed speedups or retention rates.
+Measured comparisons show about **65% less end-to-end time**, with **over 95% of known gap groups** and **over 90% of their source locations** retained. Actual results vary by project; these are observed results, not an exhaustive coverage guarantee. See [measurement details](VALIDATION.md#scan-levels) if needed.
 
 All levels retain the same Cargo build context, source-preparation checks, and second-run confirmation of new support findings. Levels 1 and 2 check and report only selected source. The difference is exploration depth, not finding confidence.
 
@@ -70,20 +61,22 @@ A **checking boundary** means a referenced type, function, or trait is currently
 
 **Use `--jobs 32 --verbose` as a starting point for multi-file scans on a machine with sufficient CPU and memory.** The CLI default is one worker; choose fewer workers on smaller or busy machines. Free workers take the next pending file, largest original source first, rather than receiving fixed file partitions. Reports retain selected-file order (normally sorted paths) and sorted locations, regardless of dispatch or completion order.
 
-For full Tokio on the measured server with 96 logical CPUs, 32 workers took **153.1 s** with about **15.2 GiB** peak summed RSS; 64 took **144.6 s** with about **28.6 GiB**. Doubling workers saved only another **5.5%** wall time, so 32 is the recommended resource/time balance for that workload. This is not a universal optimum; see [validation](VALIDATION.md#largest-source-first-dispatch).
-
 `--verbose` shows worker readiness, dispatched and completed files, probe/confirmation phases, round timings, and newly confirmed groups with original errors and locations. **Ready workers and dispatched files are not completed files**: `[dispatch n/m]` counts this invocation's pending queue, while `[n/total]` counts finished file frontiers, including reused ones. New gap notices appear only after confirmation evidence has been saved; repeated groups are not announced again.
 
 Concurrency and verbosity do not change the selected scope or confirmation standard. Each file's rounds remain sequential, and more workers do not guarantee linear speedup. `--timeout SECONDS` sets the total build/scan budget (default: one hour), not a separate allowance per worker. A fixed budget can leave different files unfinished at different worker counts; that coverage remains explicit.
 
 ## Read the result
 
-Open the printed **`report.md`**, including on a nonzero exit. It groups language rejections by error family and library/model gaps by public API when available, separating selected-source and dependency findings. Locations link to unchanged files under `originals/`, with visible line/column numbers and `#L` anchors; line navigation depends on your Markdown viewer. Keep `originals/` beside the reports when moving them.
+For normal use, **read `report.md`**: it contains the findings, coverage summary, and unfinished file frontiers. Read it even on a nonzero exit. It groups language rejections by error family and library/model gaps by public API, separating selected-source and dependency findings. Counts are diagnostic/API groups, not distinct Rust features or proved functions.
+
+**`review.md` is optional troubleshooting material**, not routine reading. Open it when investigating a setup/compiler failure or why particular code remains unchecked; a partial scan alone does not require reading it. The other files below retain evidence for deeper analysis and replay.
+
+Locations link to unchanged files under `originals/`, with visible line/column numbers and `#L` anchors; line navigation depends on your Markdown viewer. Keep `originals/` beside the reports when moving them.
 
 | File | Purpose |
 |---|---|
 | `report.md` / `report.json` | Reproduced gaps, source scope, coverage, and remaining file frontiers |
-| `review.md` | Checking boundaries, migration requirements, setup/preparation problems, and compiler failures; not counted as support gaps |
+| `review.md` | Optional diagnostics for checking boundaries, migration work, setup/preparation problems, and compiler failures |
 | `project.json` / `replay.json` | Build configuration, toolchain/dependency identities, adaptations, and replay commands |
 | `originals/` / `shards/` | Unchanged sources and every round's raw output, source overlay, edits, and confirmation evidence |
 | `workers/` | Private concurrent scan copies and their replay context |

@@ -26,7 +26,7 @@ Setup validates the latest official Verus distribution, matching Rust, vstd, and
 | `1` | Deeper selected-source investigation past those boundaries, when specifically needed |
 | `0` | Include resolvable local dependencies needed to continue checking, when dependency findings are requested |
 
-The README's recorded serial comparisons explain this recommendation: level 2 saved **65.2% whole-command time** on Tokio mutex while retaining **100% of 15 groups and 39 primary group/location records**; Base64 saved **83.6% summed compiler time**, retaining **97.3% of groups (71/73)** and **92.2% of primary group/location records (106/115)**. A full-Tokio scan retained **all 560 known reference groups** (22 language, 538 library/model). Base64/full-Tokio references use different scanner revisions; their comparisons are not same-revision level-only benchmarks. Present these as measured retention, not guaranteed speedups or exhaustive recall.
+Measured comparisons show about **65% less end-to-end time**, retaining **over 95% of known gap groups** and **over 90% of their source locations**. Present these as observed reference retention, not guaranteed speedups or exhaustive recall. Keep detailed comparisons in the tool's `VALIDATION.md`, not a routine user-facing answer.
 
 A checking boundary means a referenced type, function, or trait is outside Verus checking or has been explicitly excluded. It can occur inside selected source or at a dependency and is not automatically a missing library model. Level-2 boundary-only stops remain **partial** and can hide additional gaps. All levels keep the same build controls and repeated confirmation; exploration depth is not finding confidence.
 
@@ -38,7 +38,9 @@ The scanner works in an isolated copy and validates unchanged Rust, prepared sou
 
 ## Read evidence before drawing a conclusion
 
-Read `report.md`, `report.json`, `review.md`, and `project.json`, even on a nonzero exit. Inspect representative per-round `verus.txt`, source overlays, and confirmation evidence before interpreting each diagnostic family. Accepted support findings must map to checked original source and repeat under the same recorded overlay.
+Start with `report.md`, even on a nonzero exit; it is the primary user-facing result and includes coverage limits. For detailed analysis, use `report.json`, `project.json`, and representative per-round `verus.txt`, source overlays, and confirmations before interpreting each diagnostic family. Accepted support findings must map to checked original source and repeat under the same recorded overlay.
+
+Use `review.md` only when investigating setup/preparation failures, compiler errors, or unchecked code. Do not ask users to read it routinely or solely because a scan is partial; explain the relevant limit from `report.md` instead.
 
 Markdown source links target unchanged files under `originals/`, not scan overlays. Keep that directory with the reports; `#L` navigation depends on the viewer. Raw diagnostic text stays unchanged, while original locations are source-mapped.
 
