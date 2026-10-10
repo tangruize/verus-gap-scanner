@@ -14,8 +14,93 @@ from pathlib import Path
 
 from .engine import canonical, probe
 from .gap import GapError
-from .project import prepare, resume, scan_level_from, write_json
-from .report import public_api, save_report
+from .project import Project, prepare, resume, scan_level_from, write_json
+from .report import atomic_text, main as report_main, public_api, report_lock, save_report
+
+
+class ReportProgress:
+    def __init__(self, project: Project, selected: list[str], shards: list[dict],
+                 verbose: VerboseProgress | None):
+        self.project = project
+        self.selected = selected
+        self.shards = shards
+        self.verbose = verbose
+        self.counts = verbose or VerboseProgress(selected, fast=scan_level_from(project.manifest) > 0)
+        self.directory: Path | None = None
+        self.active: dict | None = None
+        self.last_refresh = time.monotonic()
+        self.report: dict | None = None
+        self.published_groups: set[tuple] = set()
+
+    def start(self, focus: str, directory: Path):
+        self.directory = directory
+        self.active = None
+        relative = str(directory.relative_to(self.project.output))
+        self.project.manifest["scan_progress"] = {
+            "state": "running", "active_file": focus, "active_shard": relative,
+        }
+        self.project.manifest.setdefault("shard_index", {})[focus] = relative
+        self.project.save()
+
+    def refresh(self) -> dict:
+        current = self.active
+        shards = list(self.shards)
+        if current is not None and not any(shard["focus"] == current.get("focus") for shard in shards):
+            shards.append(current)
+        report = save_report(self.project, shards, self.selected)
+        self.report = report
+        self.published_groups = set(self.counts.groups)
+        self.last_refresh = time.monotonic()
+        return report
+
+    def refresh_due(self) -> bool:
+        return bool(self.counts.groups - self.published_groups) and (
+            time.monotonic() - self.last_refresh >= 60
+        )
+
+    def finish_file(self) -> dict:
+        if self.shards:
+            self.counts.observe(self.shards[-1].get("observations", []), announce=False)
+        self.active = None
+        self.directory = None
+        self.project.manifest["scan_progress"] = {"state": "running"}
+        self.project.save()
+        if self.report is None or self.refresh_due():
+            return self.refresh()
+        return self.report
+
+    def finish(self, state: str) -> dict:
+        self.project.manifest["scan_progress"] = {"state": state}
+        self.project.save()
+        return self.refresh()
+
+    def interrupt(self) -> dict:
+        progress = self.project.manifest.get("scan_progress", {})
+        if any(shard["focus"] == progress.get("active_file") for shard in self.shards):
+            self.active = None
+            progress = {}
+        elif self.directory is not None:
+            checkpoint = self.directory / "report.json"
+            if checkpoint.is_file():
+                self.active = dict(
+                    json.loads(checkpoint.read_text()),
+                    directory=str(self.directory.relative_to(self.project.output)),
+                )
+        self.project.manifest["scan_progress"] = {**progress, "state": "interrupted"}
+        self.project.verify_originals()
+        return self.refresh()
+
+    def __call__(self, phase: str, details: dict):
+        if phase in {"restore", "round"} and self.directory is not None:
+            self.active = dict(
+                details["summary"], directory=str(self.directory.relative_to(self.project.output)),
+            )
+        if self.verbose is not None:
+            self.verbose(phase, details)
+        elif phase in {"restore", "round"}:
+            self.counts.observe(details.get("observations", []), announce=False)
+        if phase == "round" and self.refresh_due():
+            self.refresh()
 
 
 class VerboseProgress:
@@ -110,6 +195,8 @@ class VerboseProgress:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(sys.argv[1:] if argv is None else argv)
+    if values[:1] == ["report"]:
+        return report_main(values[1:])
     options = values[:values.index("--")] if "--" in values else values
     if "--frontier" in options:
         if any(option == "--scan-level" or option.startswith("--scan-level=") for option in options):
@@ -130,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         values, cargo = values[:index], values[index + 1:]
     parser = argparse.ArgumentParser(
         description="Find reproducible Verus support gaps in an isolated Rust project copy.",
+        epilog="Use 'verus-gap report RESULT_DIR' to refresh saved reports without scanning.",
     )
     parser.add_argument("path", nargs="?", default=".", help="crate directory, Cargo.toml, or .rs file")
     parser.add_argument("--features", help="Cargo features (full is automatically used when the crate defines it)")
@@ -169,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: Output directory is not empty: {output}", file=sys.stderr)
         return 2
     project = None
+    reporting = None
     try:
         level = 0 if requested_level is None else requested_level
         if args.resume:
@@ -208,6 +297,10 @@ def main(argv: list[str] | None = None) -> int:
         if progress is not None:
             progress.write(f"[scan] level={level}; mode={mode}; {len(selected)} selected file(s); reports: {output}")
         shards = []
+        reporting = ReportProgress(project, selected, shards, progress)
+        project.manifest["scan_progress"] = {"state": "running"}
+        project.save()
+        reporting.refresh()
         revision = hashlib.sha256(json.dumps(project.manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
         for index, name in enumerate(selected):
             if time.monotonic() >= project.deadline:
@@ -234,25 +327,26 @@ def main(argv: list[str] | None = None) -> int:
                         progress.write(f"[reuse] {name}; using saved frontier without new probes")
                 elif same_scan:
                     directory = cached_path
-                    result = probe(project, name, directory, scan_level=level, progress=progress)
+                    reporting.start(name, directory)
+                    result = probe(project, name, directory, scan_level=level, progress=reporting)
                 else:
                     directory = base / revision
-                    result = probe(project, name, directory, scan_level=level, progress=progress)
+                    reporting.start(name, directory)
+                    result = probe(project, name, directory, scan_level=level, progress=reporting)
             else:
-                result = probe(project, name, directory, scan_level=level, progress=progress)
+                reporting.start(name, directory)
+                result = probe(project, name, directory, scan_level=level, progress=reporting)
             result["scanner_revision"] = revision
             result["directory"] = str(directory.relative_to(output))
             write_json(directory / "report.json", result)
             project.manifest.setdefault("shard_index", {})[name] = result["directory"]
-            project.save()
             shards.append(result)
-            report = save_report(project, shards, selected)
-            accepted = sum(report["counts"].get(key, 0)
-                           for key in ("language_rejection", "library_specification"))
+            report = reporting.finish_file()
+            accepted = len(reporting.counts.groups)
             print(f"[{index + 1}/{len(selected)}] {name}: {result['stop_reason']}; "
                   f"{accepted} reproducible support-gap groups so far.", flush=True)
         project.verify_originals()
-        report = save_report(project, shards, selected)
+        report = reporting.finish("finished" if len(shards) == len(selected) else "stopped")
         print(f"\n{report['status']}: {output / 'report.md'}", flush=True)
         if report["coverage"]["pending_files"]:
             return 2
@@ -263,13 +357,25 @@ def main(argv: list[str] | None = None) -> int:
     except (GapError, OSError, UnicodeError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         output.mkdir(parents=True, exist_ok=True)
-        (output / "report.md").write_text(
-            "# Verus compatibility inventory\n\n"
-            "**Blocked before a reliable inventory could be produced.**\n\n"
-            + str(error) + "\n\nSee `project.json`, `baseline.stdout`, and `baseline.stderr` if present.\n"
-        )
+        try:
+            with report_lock(output):
+                atomic_text(
+                    output / "report.md",
+                    "# Verus compatibility inventory\n\n"
+                    "**Blocked before a reliable inventory could be produced.**\n\n"
+                    + str(error) + "\n\nSee `project.json`, `baseline.stdout`, and `baseline.stderr` if present.\n",
+                )
+        except OSError as report_error:
+            print(f"error: Could not write the blocked report: {report_error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
+        if reporting is not None:
+            try:
+                reporting.interrupt()
+            except (GapError, OSError, UnicodeError, json.JSONDecodeError) as error:
+                print(f"error: Could not refresh interrupted reports: {error}", file=sys.stderr)
+            else:
+                print(f"Interrupted report: {output / 'report.md'}", file=sys.stderr)
         print(f"Interrupted; completed evidence is retained in {output}. Resume with --resume.", file=sys.stderr)
         return 2
 

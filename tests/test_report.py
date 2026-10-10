@@ -1,16 +1,213 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
+import json
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from verus_gap.report import aggregate, language_family, markdown, public_api, review_markdown, source_link
+from verus_gap.project import write_json
+from verus_gap.report import (
+    aggregate, atomic_text, language_family, main, markdown, public_api, refresh_report,
+    review_markdown, source_link,
+)
+from verus_gap.source import Cfg, Source
 
 
 class ReportTests(unittest.TestCase):
+    def saved_result(self, temporary: str, *, state: str = "interrupted"):
+        output = Path(temporary) / "results"
+        output.mkdir()
+        source = Source("src/lib.rs", b"pub fn example() {}\n", Cfg([]))
+        original = output / "originals/src/lib.rs"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(source.data)
+        directory = "shards/" + hashlib.sha256(source.file.encode()).hexdigest()[:12]
+        manifest = {
+            "schema": "verus-gap/project-v2", "input": "/missing/original/input",
+            "package": "fixture", "verus": {"version": "fixture"}, "baseline_passed": True,
+            "cargo_args": [], "checks": {"proof_lifetimes": True}, "workspace_restored": True,
+            "rust_cfg": [], "tool_sha256": {}, "scan_level": 2,
+            "active_sources": {source.file: source.identity()}, "selected_files": [source.file],
+            "shard_index": {source.file: directory},
+            "scan_progress": {"state": state, "active_file": source.file, "active_shard": directory},
+        }
+        revision = hashlib.sha256(json.dumps({}, sort_keys=True).encode()).hexdigest()[:12]
+        place = {"file": source.file, "byte": 0, "line": 1, "column": 1, "source": "pub fn example() {}"}
+        record = {
+            "category": "library_specification", "level": "error", "message": "model not recognized",
+            "rendered": "unchanged raw diagnostic", "locations": [place], "related_locations": [],
+            "confirmed": True, "macro_expansion": False, "raw_diagnostic": None,
+            "scope": [source.file], "source_variant": "prepared", "round": 0,
+            "evidence": "round-000/verus.txt",
+        }
+        shard = {
+            "schema": "verus-gap/shard-v2", "scanner_revision": revision,
+            "observations": [record, dict(record, confirmed=False, message="not yet confirmed")],
+            "rounds": [{"round": 0}], "events": [], "focus": source.file, "scope": [source.file],
+            "status": "partial", "stop_reason": "interrupted" if state == "interrupted" else "",
+            "scan_level": 2, "workspace_restored": True,
+        }
+        checkpoint = output / directory / "report.json"
+        checkpoint.parent.mkdir(parents=True)
+        write_json(output / "project.json", manifest)
+        write_json(checkpoint, shard)
+        for relative in ("round-000/verus.txt", "round-000/confirmation/verus.txt"):
+            evidence = checkpoint.parent / relative
+            evidence.parent.mkdir(parents=True, exist_ok=True)
+            evidence.write_text(record["rendered"])
+        return output, manifest, shard, checkpoint
+
+    def test_manual_refresh_uses_saved_evidence_without_input_workspace_or_compiler(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary)
+            evidence = {
+                path: path.read_bytes() for path in output.rglob("*") if path.is_file()
+            }
+            with mock.patch("verus_gap.gap.run", side_effect=AssertionError("No compiler allowed")):
+                report = refresh_report(output)
+                with redirect_stdout(io.StringIO()) as terminal:
+                    self.assertEqual(main([str(output)]), 0)
+            self.assertIn("Reports refreshed from saved evidence", terminal.getvalue())
+            self.assertEqual(report["counts"]["library_specification"], 1)
+            self.assertEqual(report["counts"]["unconfirmed_support_diagnostic"], 1)
+            self.assertEqual(report["scan_level"], 2)
+            self.assertEqual(report["scan_progress"]["state"], "interrupted")
+            self.assertEqual(report["scan_progress"]["completed_files"], 0)
+            self.assertEqual(report["scan_progress"]["last_completed_round"], 0)
+            self.assertEqual(report["coverage"]["partial_files"], 1)
+            self.assertIn("snapshot of completed, checkpointed rounds", (output / "report.md").read_text())
+            self.assertIn("unchanged raw diagnostic", (output / "report.md").read_text())
+            self.assertIn("interrupted", (output / "review.md").read_text())
+            self.assertTrue((output / "agent-tasks.json").is_file())
+            for path, before in evidence.items():
+                self.assertEqual(path.read_bytes(), before, str(path))
+            self.assertFalse((output / "workspace").exists())
+            self.assertEqual(json.loads(checkpoint.read_text()), shard)
+            self.assertEqual(json.loads((output / "project.json").read_text()), manifest)
+
+    def test_manual_refresh_finds_an_unregistered_active_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            manifest.pop("shard_index")
+            manifest.pop("scan_progress")
+            write_json(output / "project.json", manifest)
+            report = refresh_report(output)
+            self.assertEqual(report["counts"]["library_specification"], 1)
+            self.assertEqual(report["scan_progress"]["state"], "incomplete")
+            self.assertEqual(report["scan_progress"]["active_file"], shard["focus"])
+
+    def test_manual_refresh_before_the_first_checkpoint_retains_pending_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            checkpoint.unlink()
+            report = refresh_report(output)
+            self.assertEqual(report["counts"], {})
+            self.assertEqual(report["coverage"]["pending_files"], 1)
+            self.assertEqual(report["scan_progress"]["state"], "running")
+            self.assertIsNone(report["scan_progress"]["last_completed_round"])
+
+    def test_manual_refresh_during_revision_specific_resume_does_not_mix_old_findings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary, state="running")
+            next_source = Source("src/next.rs", b"pub fn next() {}\n", Cfg([]))
+            next_original = output / "originals" / next_source.file
+            next_original.write_bytes(next_source.data)
+            manifest["active_sources"][next_source.file] = next_source.identity()
+            manifest["selected_files"].append(next_source.file)
+            manifest["tool_sha256"] = {"changed": "new scanner identity"}
+            manifest["scan_progress"]["active_file"] = next_source.file
+            next_directory = "shards/" + hashlib.sha256(next_source.file.encode()).hexdigest()[:12]
+            manifest["shard_index"][next_source.file] = next_directory
+            manifest["scan_progress"]["active_shard"] = next_directory
+            write_json(output / "project.json", manifest)
+            before = checkpoint.read_bytes()
+            report = refresh_report(output)
+            self.assertEqual(report["counts"], {})
+            self.assertEqual(report["coverage"]["pending_files"], 2)
+            self.assertEqual(report["other_revision_checkpoints"][0]["file"], shard["focus"])
+            self.assertIn("retained but not included", (output / "report.md").read_text())
+            self.assertEqual(checkpoint.read_bytes(), before)
+
+    def test_invalid_saved_evidence_preserves_the_previous_report(self):
+        for problem in (
+            "original", "scope", "revision", "level", "path", "missing", "json",
+            "diagnostic", "confirmation", "unfinished-round", "source-location", "metadata",
+        ):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, shard, checkpoint = self.saved_result(temporary)
+                report = output / "report.md"
+                report.write_text("previous report")
+                if problem == "original":
+                    (output / "originals/src/lib.rs").write_text("changed original")
+                elif problem == "scope":
+                    shard["focus"] = "outside.rs"
+                    write_json(checkpoint, shard)
+                elif problem == "revision":
+                    shard["scanner_revision"] = "different"
+                    write_json(checkpoint, shard)
+                elif problem == "level":
+                    shard["scan_level"] = 0
+                    write_json(checkpoint, shard)
+                elif problem == "path":
+                    manifest["shard_index"]["src/lib.rs"] = "../outside"
+                    write_json(output / "project.json", manifest)
+                elif problem == "missing":
+                    manifest["scan_progress"] = {"state": "finished"}
+                    write_json(output / "project.json", manifest)
+                    checkpoint.unlink()
+                elif problem == "json":
+                    checkpoint.write_text("{invalid")
+                elif problem == "diagnostic":
+                    (checkpoint.parent / "round-000/verus.txt").unlink()
+                elif problem == "confirmation":
+                    (checkpoint.parent / "round-000/confirmation/verus.txt").unlink()
+                elif problem == "unfinished-round":
+                    shard["observations"][0]["round"] = 1
+                    write_json(checkpoint, shard)
+                elif problem == "source-location":
+                    shard["observations"][0]["locations"][0]["file"] = []
+                    write_json(checkpoint, shard)
+                elif problem == "metadata":
+                    manifest["shard_index"] = []
+                    write_json(output / "project.json", manifest)
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(main([str(output)]), 2)
+                self.assertIn("Could not refresh reports", errors.getvalue())
+                self.assertEqual(report.read_text(), "previous report")
+
+    def test_atomic_report_text_preserves_the_previous_file_on_failed_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            report = output / "report.md"
+            report.write_text("previous report")
+            with mock.patch.object(Path, "replace", side_effect=OSError("cannot replace")):
+                with self.assertRaisesRegex(OSError, "cannot replace"):
+                    atomic_text(report, "new report")
+            self.assertEqual(report.read_text(), "previous report")
+            self.assertEqual(list(output.iterdir()), [report])
+
+    def test_parallel_manual_refreshes_are_serialized_and_leave_complete_reports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, shard, checkpoint = self.saved_result(temporary)
+            before = checkpoint.read_bytes()
+            with ThreadPoolExecutor(max_workers=4) as workers:
+                results = list(workers.map(lambda _: refresh_report(output), range(8)))
+            self.assertTrue(all(report["counts"]["library_specification"] == 1 for report in results))
+            self.assertEqual(json.loads((output / "report.json").read_text())["groups"], results[-1]["groups"])
+            self.assertIn("unchanged raw diagnostic", (output / "report.md").read_text())
+            self.assertIn("interrupted", (output / "review.md").read_text())
+            self.assertEqual(checkpoint.read_bytes(), before)
+            self.assertEqual(list(output.glob(".*.tmp")), [])
+
     def test_source_link_uses_the_original_file_and_preserves_visible_line_and_column(self):
         place = {"file": "src/engine/general_purpose/decode.rs", "line": 122, "column": 5}
         self.assertEqual(

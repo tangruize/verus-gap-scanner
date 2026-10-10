@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from verus_gap.cli import VerboseProgress, main
+from verus_gap.cli import ReportProgress, VerboseProgress, main
 from verus_gap.gap import GapError
 from verus_gap.project import scan_level_from
 
@@ -29,6 +29,7 @@ class ScanLevelTests(unittest.TestCase):
                 project = SimpleNamespace(
                     manifest={"tool_sha256": {}}, sources={"lib.rs": SimpleNamespace()},
                     deadline=time.monotonic() + 30, save=mock.Mock(), verify_originals=mock.Mock(),
+                    output=Path(temporary) / "results",
                 )
 
                 def probing(project, focus, directory, *, scan_level, progress):
@@ -245,6 +246,127 @@ class VerboseProgressTests(unittest.TestCase):
             status = main(["--frontier", "--", "--verbose"])
         self.assertEqual(status, 0)
         frontier.assert_called_once_with(["--", "--verbose"])
+
+
+class ReportProgressTests(unittest.TestCase):
+    def test_round_refresh_waits_exactly_one_minute_and_does_not_need_verbose(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = SimpleNamespace(
+                output=Path(temporary), manifest={}, save=mock.Mock(), verify_originals=mock.Mock(),
+            )
+            with mock.patch("verus_gap.cli.time.monotonic", return_value=0) as clock, mock.patch(
+                "verus_gap.cli.save_report", return_value={"counts": {}},
+            ) as writing:
+                progress = ReportProgress(project, ["lib.rs"], [], None)
+                directory = project.output / "shards" / "fixture"
+                progress.start("lib.rs", directory)
+                progress.refresh()
+                summary = {"observations": [], "rounds": [{"round": 0}]}
+                first = {
+                    "category": "library_specification", "message": "first missing model",
+                    "confirmed": True, "locations": [{"file": "lib.rs", "line": 1, "column": 1}],
+                    "raw_diagnostic": None,
+                }
+                for now in (0, 30, 59.999):
+                    clock.return_value = now
+                    progress("round", {"summary": summary, "observations": [first]})
+                self.assertEqual(writing.call_count, 1)
+                clock.return_value = 60
+                progress("round", {"summary": summary, "observations": [first]})
+                self.assertEqual(writing.call_count, 2)
+                written = writing.call_args.args[1]
+                self.assertEqual(len(written), 1)
+                self.assertEqual(written[0]["directory"], "shards/fixture")
+                self.assertEqual(written[0]["rounds"], [{"round": 0}])
+                clock.return_value = 119.999
+                second = dict(first, message="second missing model")
+                progress("round", {"summary": summary, "observations": [second]})
+                self.assertEqual(writing.call_count, 2)
+                clock.return_value = 120
+                progress("round", {"summary": summary, "observations": [second]})
+                self.assertEqual(writing.call_count, 3)
+
+    def test_file_completion_is_throttled_but_final_refresh_is_forced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = SimpleNamespace(
+                output=Path(temporary), manifest={}, save=mock.Mock(), verify_originals=mock.Mock(),
+            )
+            completed = []
+            with mock.patch("verus_gap.cli.time.monotonic", return_value=0) as clock, mock.patch(
+                "verus_gap.cli.save_report", return_value={"counts": {}},
+            ) as writing:
+                progress = ReportProgress(project, ["lib.rs"], completed, None)
+                progress.refresh()
+                progress.start("lib.rs", project.output / "shards" / "fixture")
+                progress("restore", {"summary": {"observations": []}})
+                completed.append({"focus": "lib.rs"})
+                progress.finish_file()
+                self.assertEqual(writing.call_count, 1)
+                progress.finish("finished")
+                self.assertEqual(writing.call_count, 2)
+                self.assertEqual(writing.call_args.args[1], [{"focus": "lib.rs"}])
+                self.assertEqual(project.manifest["scan_progress"], {"state": "finished"})
+                clock.return_value = 60
+                progress.finish_file()
+                self.assertEqual(writing.call_count, 2)
+
+    def test_no_new_confirmed_group_means_no_periodic_or_file_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = SimpleNamespace(
+                output=Path(temporary), manifest={}, save=mock.Mock(), verify_originals=mock.Mock(),
+            )
+            with mock.patch("verus_gap.cli.time.monotonic", return_value=0) as clock, mock.patch(
+                "verus_gap.cli.save_report", return_value={"counts": {}},
+            ) as writing:
+                progress = ReportProgress(project, ["lib.rs"], [], None)
+                progress.start("lib.rs", project.output / "shards" / "fixture")
+                progress.refresh()
+                summary = {"observations": [], "rounds": [{"round": 0}]}
+                record = {
+                    "category": "library_specification", "message": "missing model",
+                    "confirmed": True, "locations": [{"file": "lib.rs", "line": 1, "column": 1}],
+                    "raw_diagnostic": None,
+                }
+                clock.return_value = 60
+                progress("round", {"summary": summary, "observations": [
+                    dict(record, category="checking_boundary"), dict(record, confirmed=False),
+                ]})
+                self.assertEqual(writing.call_count, 1)
+                progress("round", {"summary": summary, "observations": [record]})
+                self.assertEqual(writing.call_count, 2)
+                clock.return_value = 120
+                progress("round", {"summary": summary, "observations": [
+                    dict(record, locations=[{"file": "lib.rs", "line": 8, "column": 3}]),
+                ]})
+                progress.finish_file()
+                self.assertEqual(writing.call_count, 2)
+                progress.finish("finished")
+                self.assertEqual(writing.call_count, 3)
+
+    def test_report_command_is_independent_of_scan_options_and_setup(self):
+        with mock.patch("verus_gap.cli.report_main", return_value=0) as reporting, mock.patch(
+            "verus_gap.cli.prepare",
+        ) as preparing, mock.patch("verus_gap.cli.resume") as resuming, mock.patch("verus_gap.cli.probe") as probing:
+            self.assertEqual(main(["report", "saved-results"]), 0)
+        reporting.assert_called_once_with(["saved-results"])
+        preparing.assert_not_called()
+        resuming.assert_not_called()
+        probing.assert_not_called()
+
+    def test_ctrl_c_after_a_file_completed_does_not_duplicate_its_frontier(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = SimpleNamespace(
+                output=Path(temporary), manifest={}, save=mock.Mock(), verify_originals=mock.Mock(),
+            )
+            completed = [{"focus": "lib.rs", "observations": []}]
+            with mock.patch("verus_gap.cli.save_report", return_value={"counts": {}}) as writing:
+                progress = ReportProgress(project, ["lib.rs"], completed, None)
+                progress.start("lib.rs", project.output / "shards" / "fixture")
+                progress.active = {"focus": "lib.rs", "observations": []}
+                progress.interrupt()
+            self.assertEqual(writing.call_args.args[1], completed)
+            self.assertEqual(project.manifest["scan_progress"], {"state": "interrupted"})
+            project.verify_originals.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -273,8 +273,8 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
             path = project.source_paths[name]
             maps[str(path)] = mapped
             if mapped.data != source.data:
-                path.write_bytes(mapped.data)
                 modified.append(name)
+                path.write_bytes(mapped.data)
                 copied = directory / "sources" / name
                 copied.parent.mkdir(parents=True, exist_ok=True)
                 copied.write_bytes(mapped.data)
@@ -484,7 +484,8 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
     budget = max_rounds if max_rounds is not None else 4 + 3 * sum(
         len(source.declarations) for source in project.sources.values()
     )
-    notify("restore", observations=list(summary["observations"]))
+    summary["stop_reason"] = ""
+    notify("restore", observations=list(summary["observations"]), summary=summary)
     try:
         for number in range(start, start + budget):
             if time.monotonic() >= project.deadline:
@@ -567,7 +568,8 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             write_json(output / "report.json", summary)
             notify("round", round=number, observations=new_observations,
                    seconds=result["seconds"], confirmation_seconds=confirmation_seconds,
-                   confirmation_performed=bool(new_candidates or panic), blockers=blockers)
+                   confirmation_performed=bool(new_candidates or panic), blockers=blockers,
+                   summary=summary)
             if result["timed_out"]:
                 summary["stop_reason"] = "per_run_timeout"
                 break
@@ -624,6 +626,9 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             notify("action", round=number + 1, events=state.events[event_offset:])
         else:
             summary["stop_reason"] = "round_limit"
+    except KeyboardInterrupt:
+        summary["stop_reason"] = "interrupted"
+        raise
     except (GapError, OSError, UnicodeError) as error:
         summary["stop_reason"] = "execution_failure"
         summary["error"] = str(error)

@@ -57,6 +57,16 @@ Add **`--verbose`** to see live probe/confirmation phases, round timings, scope 
 
 Output is flushed as progress becomes available, including through a file or pipe. A limitation is announced only after its confirmation and evidence have been saved. Repeated groups are not announced again; selected-source and dependency findings are labeled separately. Setup errors, checking boundaries and compiler failures are not announced as limitations. The final reports and raw evidence are still saved normally. Verbosity changes display only and can be enabled or disabled on resume.
 
+Reports are available as soon as setup finishes. During scanning, completed rounds and files refresh them only when at least one minute has elapsed and a new confirmed diagnostic/API group has been found since the previous automatic refresh. Repeated locations, checking boundaries, and progress changes alone do not trigger another full rewrite; file completion does not bypass these conditions. Normal exit always refreshes them immediately. A long-running probe or confirmation keeps the previous snapshot until the round finishes. **Ctrl+C** restores the scan copy and writes an **interrupted** report using the latest completed rounds, including findings from the current file. Pending files and unfinished frontiers stay visible; a partially completed confirmation is never counted as a confirmed gap.
+
+Refresh an existing result manually, including while a scan is running:
+
+```bash
+./verus-gap report /path/to/verus-gap-results/RESULT
+```
+
+This command reads retained original sources and saved checkpoints and rewrites only `report.md`, `review.md`, `report.json`, and `agent-tasks.json`. It does not run Cargo or Verus, resume the scan, change the recorded scanner/compiler identity, or require the original input or copied build workspace. Successful refresh exits 0 even when the report contains limitations; missing or inconsistent saved evidence is an error. Automatic and manual report writers are serialized, and files are replaced atomically so readers never see a partly written file. After forced termination or a crash, the manual command can rebuild a report from the last saved checkpoints; unlike Ctrl+C, a forced kill cannot run an exit handler.
+
 Resume validates the input, compiler and dependency identities, reuses completed work, and continues unfinished scans. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour).
 
 Resume inherits the recorded scan level when none is specified and rejects an explicitly different level. Level-2 boundary-only stops are deliberately finished under that policy, although coverage remains partial; resume reuses their evidence without another probe. Start a new output directory to change levels or investigate those boundaries further.

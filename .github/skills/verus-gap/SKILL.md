@@ -38,6 +38,8 @@ A checking boundary means a referenced type, function, or trait is currently out
 
 Use `--verbose` with any level when live progress is useful. It flushes round/confirmation/action updates and newly confirmed groups with original errors and locations. Repeated groups are deduplicated, level-1/2 findings stay in selected source, and unconfirmed/setup/compiler diagnostics are not labeled limitations. Verbosity adds no compiler calls and may be changed on resume; still read the final reports and raw evidence.
 
+Reports start after setup. Completed rounds and files refresh them only when a minute has elapsed and a new confirmed diagnostic/API group exists; repeated locations and boundary/progress-only changes do not trigger a rewrite. File completion does not bypass these conditions. Normal exit always refreshes them. Ctrl+C restores sources and writes an interrupted snapshot containing only completed, checkpointed rounds. Use `./verus-gap report RESULT_DIR` to refresh manually without Cargo, Verus, resuming, or changing raw evidence and scanner/compiler identities. Keep `originals/`, `project.json`, and `shards/`; the original input and build workspace are not needed. Read snapshot state, pending files, and active/unfinished frontiers before interpreting counts.
+
 Build scripts and macros execute in the copy. Use trusted input and preserve the original project.
 
 ## Read evidence before drawing a conclusion

@@ -50,19 +50,26 @@ def run(command: list[str], cwd: Path, env: dict[str, str], timeout: float) -> d
         )
     except OSError as error:
         raise GapError(f"Cannot run {command[0]}: {error}") from error
+
+    def stop(signum: int):
+        try:
+            os.killpg(proc.pid, signum)
+        except ProcessLookupError:
+            pass
+
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        os.killpg(proc.pid, signal.SIGKILL)
+        stop(signal.SIGKILL)
         stdout, stderr = proc.communicate()
     except KeyboardInterrupt:
-        os.killpg(proc.pid, signal.SIGTERM)
+        stop(signal.SIGTERM)
         try:
             proc.communicate(timeout=3)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            stop(signal.SIGKILL)
             proc.communicate()
         raise
     return {

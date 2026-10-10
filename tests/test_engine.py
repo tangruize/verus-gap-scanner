@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,7 +15,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from verus_gap.engine import DependencyIndex, State, canonical, classify, compiler_panic, dependencies, parse_output, probe
+from verus_gap.engine import DependencyIndex, State, canonical, classify, compiler_panic, dependencies, execute, parse_output, probe
+from verus_gap.gap import run
 from verus_gap.source import Cfg, Source
 
 
@@ -149,6 +152,84 @@ class PerformanceTests(unittest.TestCase):
         self.assertTrue(completed[0]["observations"][0]["confirmed"])
         self.assertEqual(completed[1]["observations"], [])
         self.assertEqual(progress.call_args_list[0].args[1]["observations"], [])
+
+    def test_ctrl_c_keeps_only_complete_rounds_and_marks_the_checkpoint_interrupted(self):
+        support = self.support()
+        result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+        for interrupted_call, expected_rounds, expected_observations in (
+            (0, 0, 0), (1, 0, 0), (2, 1, 1),
+        ):
+            with self.subTest(interrupted_call=interrupted_call), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                project = SimpleNamespace(
+                    manifest={"tool_sha256": {}}, sources={}, deadline=time.monotonic() + 30,
+                    verify_originals=mock.Mock(),
+                )
+                calls = [(result, [support], "")] * interrupted_call + [KeyboardInterrupt()]
+
+                def advance(project, state, records, number):
+                    state.bodies.setdefault("lib.rs", set()).add(str(number))
+                    return True
+
+                with mock.patch("verus_gap.engine.execute", side_effect=calls), mock.patch(
+                    "verus_gap.engine.refine", side_effect=advance,
+                ), self.assertRaises(KeyboardInterrupt):
+                    probe(project, "lib.rs", directory, max_rounds=2, scan_level=1)
+                saved = json.loads((directory / "report.json").read_text())
+                self.assertEqual(saved["stop_reason"], "interrupted")
+                self.assertEqual(saved["status"], "partial")
+                self.assertTrue(saved["workspace_restored"])
+                self.assertEqual(len(saved["rounds"]), expected_rounds)
+                self.assertEqual(len(saved["observations"]), expected_observations)
+                if expected_observations:
+                    self.assertTrue(saved["observations"][0]["confirmed"])
+                    self.assertEqual(saved["observations"][0]["evidence"], "round-000/verus.txt")
+                project.verify_originals.assert_called_once()
+
+    def test_interruption_during_source_write_restores_the_changed_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = Source("lib.rs", b"pub fn example() {}\n", Cfg([]))
+            working = root / source.file
+            working.write_bytes(source.data)
+            project = SimpleNamespace(
+                manifest={"root_source": source.file}, sources={source.file: source},
+                source_paths={source.file: working}, workspace=root, cwd=root, env={},
+                command=["unused-verus", "--out-dir", str(root / "build")],
+                deadline=time.monotonic() + 30,
+            )
+            original_write = Path.write_bytes
+
+            def interrupt_after_write(path, data):
+                written = original_write(path, data)
+                if path == working and data != source.data:
+                    raise KeyboardInterrupt
+                return written
+
+            with mock.patch.object(Path, "write_bytes", interrupt_after_write), mock.patch(
+                "verus_gap.engine.run",
+            ) as running:
+                with self.assertRaises(KeyboardInterrupt):
+                    execute(project, State([source.file]), root / "probe", 30)
+            running.assert_not_called()
+            self.assertEqual(working.read_bytes(), source.data)
+
+    def test_ctrl_c_remains_an_interrupt_if_the_compiler_has_already_exited(self):
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                child = mock.Mock(pid=1234)
+                child.communicate.side_effect = [
+                    KeyboardInterrupt(),
+                    *([subprocess.TimeoutExpired("fixture", 3)] if delayed else []),
+                    (b"", b""),
+                ]
+                with mock.patch("verus_gap.gap.subprocess.Popen", return_value=child), mock.patch(
+                    "verus_gap.gap.os.killpg", side_effect=ProcessLookupError,
+                ) as killing, self.assertRaises(KeyboardInterrupt):
+                    run(["fixture"], Path("."), {}, 10)
+                self.assertEqual(child.communicate.call_count, 3 if delayed else 2)
+                self.assertEqual(killing.call_count, 2 if delayed else 1)
+                self.assertEqual(killing.call_args_list[0].args, (1234, signal.SIGTERM))
 
     def test_progress_never_announces_unconfirmed_stored_observations(self):
         support = self.support()
@@ -415,7 +496,10 @@ class RealInventoryTests(unittest.TestCase):
                         prefix.append(line)
                         if "[limitation]" in line:
                             self.assertIsNone(process.poll())
-                            self.assertFalse((output / "report.json").exists())
+                            initial = json.loads((output / "report.json").read_text())
+                            self.assertEqual(initial["scan_progress"]["state"], "running")
+                            self.assertEqual(initial["coverage"]["pending_files"], 1)
+                            self.assertEqual(initial["counts"], {})
                             checkpoints = list((output / "shards").glob("*/report.json"))
                             self.assertEqual(len(checkpoints), 1)
                             checkpoint = json.loads(checkpoints[0].read_text())
@@ -467,6 +551,110 @@ class RealInventoryTests(unittest.TestCase):
                 [(item["state"], item["confirmation_performed"]) for item in shard["rounds"]],
                 [(item["state"], item["confirmation_performed"]) for item in quiet_shard["rounds"]],
             )
+
+    def test_ctrl_c_writes_partial_reports_and_offline_refresh_needs_no_tools(self):
+        files = {
+            "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            "src/lib.rs": "mod selected;\nmod helper;\n",
+            "src/selected.rs": (
+                (ROOT / "tests/fixtures/frontier/lib.rs").read_text()
+                + "\npub fn blocked() -> usize { crate::helper::value() }\n"
+            ),
+            "src/helper.rs": "pub fn value() -> usize { 1 }\n",
+        }
+        for phase in ("confirmation", "second_probe"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project, output = root / "project", root / "results"
+                for name, text in files.items():
+                    path = project / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(text)
+                with subprocess.Popen(
+                    [str(ROOT / "verus-gap"), str(project / "src/selected.rs"), "--out", str(output),
+                     "--scan-level", "1", "--verbose", "--timeout", "30"],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                ) as process:
+                    try:
+                        self.assertIsNotNone(process.stdout)
+                        prefix = []
+                        for line in process.stdout:
+                            prefix.append(line)
+                            hit = "[confirm]" in line if phase == "confirmation" else (
+                                "[probe]" in line and "round 001" in line
+                            )
+                            if hit:
+                                process.send_signal(signal.SIGINT)
+                                break
+                        else:
+                            self.fail("The requested interruption phase was not reached")
+                        remaining, _ = process.communicate(timeout=30)
+                        stdout = "".join(prefix) + remaining
+                        self.assertEqual(process.returncode, 2, stdout)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+                report = json.loads((output / "report.json").read_text())
+                manifest = json.loads((output / "project.json").read_text())
+                self.assertEqual(report["scan_progress"]["state"], "interrupted", stdout)
+                self.assertEqual(report["scan_progress"]["completed_files"], 0)
+                self.assertEqual(report["coverage"]["partial_files"], 1)
+                self.assertEqual(report["coverage"]["pending_files"], 0)
+                self.assertTrue(report["workspace_restored"])
+                if phase == "confirmation":
+                    self.assertEqual(report["counts"], {})
+                    self.assertIsNone(report["scan_progress"]["last_completed_round"])
+                else:
+                    self.assertEqual(report["counts"]["language_rejection"], 1)
+                    self.assertEqual(report["counts"].get("library_specification", 0), 0)
+                    self.assertEqual(report["scan_progress"]["last_completed_round"], 0)
+                self.assertIn("Interrupted report:", stdout)
+                self.assertIn("interrupted", (output / "report.md").read_text())
+                self.assertIn("interrupted", (output / "review.md").read_text())
+                for name, text in files.items():
+                    self.assertEqual((project / name).read_text(), text)
+                    self.assertEqual((output / "workspace" / name).read_text(), text)
+                index = manifest["shard_index"]["src/selected.rs"]
+                checkpoint = output / index / "report.json"
+                self.assertEqual(json.loads(checkpoint.read_text())["stop_reason"], "interrupted")
+                evidence = {
+                    path: path.read_bytes() for path in (output / "shards").rglob("*") if path.is_file()
+                }
+                original_manifest = (output / "project.json").read_bytes()
+                (output / "workspace").rename(output / "unused-workspace")
+                refreshed = subprocess.run(
+                    [sys.executable, str(ROOT / "verus-gap"), "report", str(output)],
+                    env={**os.environ, "PATH": str(root / "no-tools")},
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(refreshed.returncode, 0, refreshed.stdout + refreshed.stderr)
+                current = json.loads((output / "report.json").read_text())
+                self.assertEqual(current["counts"], report["counts"])
+                self.assertEqual(current["groups"], report["groups"])
+                self.assertEqual(current["scan_progress"]["state"], "interrupted")
+                self.assertEqual((output / "project.json").read_bytes(), original_manifest)
+                for path, before in evidence.items():
+                    self.assertEqual(path.read_bytes(), before, str(path))
+                if phase == "second_probe":
+                    (output / "unused-workspace").rename(output / "workspace")
+                    first_round = checkpoint.parent / "round-000"
+                    stable = {
+                        path: (path.read_bytes(), path.stat().st_mtime_ns)
+                        for path in first_round.rglob("*") if path.is_file()
+                    }
+                    resumed = subprocess.run(
+                        [str(ROOT / "verus-gap"), "--resume", str(output), "--verbose"],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(resumed.returncode, 1, resumed.stdout + resumed.stderr)
+                    final = json.loads((output / "report.json").read_text())
+                    self.assertEqual(final["scan_progress"]["state"], "finished")
+                    self.assertEqual(final["counts"]["language_rejection"], 1)
+                    self.assertEqual(final["counts"]["library_specification"], 2)
+                    for path, (before, timestamp) in stable.items():
+                        self.assertEqual(path.read_bytes(), before, str(path))
+                        self.assertEqual(path.stat().st_mtime_ns, timestamp, str(path))
 
     def test_level_1_file_retains_cargo_context_without_exploring_dependency_bodies(self):
         files = {

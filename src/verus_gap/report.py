@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import argparse
+import fcntl
 import hashlib
+import json
+import os
 import re
+import sys
+import tempfile
 from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from .engine import canonical
-from .project import Project, scan_level_from, write_json
+from .gap import GapError
+from .project import Project, scan_level_from
+from .source import Cfg, Source
 
 LABELS = {
     "language_rejection": "Rust constructs rejected by Verus",
@@ -202,6 +212,64 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
     return report
 
 
+def scan_snapshot(manifest: dict, shards: list[dict], selected: list[str]) -> dict:
+    progress = manifest.get("scan_progress", {})
+    active = progress.get("active_file")
+    interrupted = next((shard for shard in shards if shard["stop_reason"] == "interrupted"), None)
+    unfinished = next((shard for shard in shards if not shard["stop_reason"]), None)
+    state = progress.get("state")
+    if state is None:
+        state = "interrupted" if interrupted else (
+            "finished" if len(shards) == len(selected) and not unfinished else "incomplete"
+        )
+        active = (interrupted or unfinished or {}).get("focus")
+    if state not in {"running", "finished", "interrupted", "stopped", "incomplete"}:
+        raise GapError(f"Unknown saved scan progress state: {state!r}.")
+    if active is not None and active not in selected:
+        raise GapError(f"Saved active file is outside the selected scope: {active!r}.")
+    current = next((shard for shard in shards if shard["focus"] == active), None)
+    rounds = current.get("rounds", []) if current else []
+    return {
+        "state": state, "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "completed_files": sum(
+            bool(shard["stop_reason"]) and shard["stop_reason"] != "interrupted"
+            and shard["focus"] != active for shard in shards
+        ),
+        "selected_files": len(selected), "active_file": active,
+        "last_completed_round": rounds[-1]["round"] if rounds else None,
+    }
+
+
+def snapshot_lines(report: dict) -> list[str]:
+    snapshot = report.get("scan_progress")
+    if snapshot is None:
+        return []
+    labels = {
+        "running": "in progress", "finished": "finished", "interrupted": "interrupted",
+        "stopped": "stopped before all selected files finished", "incomplete": "unfinished",
+    }
+    lines = [
+        f"**Scan snapshot:** {labels[snapshot['state']]}; updated `{snapshot['updated_at']}`. "
+        f"{snapshot['completed_files']}/{snapshot['selected_files']} file frontiers finished.", "",
+    ]
+    if snapshot["active_file"] is not None:
+        round_number = snapshot["last_completed_round"]
+        detail = f"; last completed round `{round_number:03d}`" if round_number is not None else (
+            "; no completed round yet"
+        )
+        lines.extend([f"**Current or interrupted file:** `{snapshot['active_file']}`{detail}.", ""])
+    if snapshot["state"] != "finished":
+        lines.extend([
+            "This is a snapshot of completed, checkpointed rounds, not a finished scan. A running or interrupted probe/confirmation is not included; new findings count only after their confirmation is saved.", "",
+        ])
+    excluded = report.get("other_revision_checkpoints", [])
+    if excluded:
+        lines.extend([
+            f"**Other scanner contexts:** {len(excluded)} saved checkpoint(s) are retained but not included in this run's findings; their selected files remain pending.", "",
+        ])
+    return lines
+
+
 def markdown(report: dict) -> str:
     coverage = report["coverage"]
     language = report["counts"].get("language_rejection", 0)
@@ -210,6 +278,7 @@ def markdown(report: dict) -> str:
     fast = level > 0
     lines = [
         "# Verus compatibility inventory", "",
+        *snapshot_lines(report),
         f"**{language} reproducible language/translation rejections and {library} library specification gaps.** "
         f"Probed {coverage['probed_files']}/{coverage['selected_files']} selected active files; "
         f"{coverage['partial_files']} file frontiers remain partial.",
@@ -322,6 +391,7 @@ def markdown(report: dict) -> str:
 
 def review_markdown(report: dict) -> str:
     review = ["# Boundaries and blockers", "",
+              *snapshot_lines(report),
               "These diagnostics are not counted as confirmed Rust or library support gaps.", "",
               "Source links open retained original files in `originals/` using `#L` line anchors; line navigation depends on the viewer.", ""]
     if report["coverage"]["checking_boundary_only_files"]:
@@ -341,11 +411,17 @@ def review_markdown(report: dict) -> str:
     return "\n".join(review)
 
 
-def save_report(project: Project, shards: list[dict], selected: list[str]) -> dict:
-    report = aggregate(project, shards, selected)
-    write_json(project.output / "report.json", report)
-    (project.output / "report.md").write_text(markdown(report))
-    (project.output / "review.md").write_text(review_markdown(report))
+def atomic_text(path: Path, text: str):
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        Path(temporary).replace(path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def write_report(output: Path, report: dict):
     tasks = [
         {
             "file": shard["focus"], "reason": shard["stop_reason"], "scan_level": shard["scan_level"],
@@ -354,5 +430,217 @@ def save_report(project: Project, shards: list[dict], selected: list[str]) -> di
         }
         for shard in report["shards"] if shard["status"] == "partial"
     ]
-    write_json(project.output / "agent-tasks.json", {"tasks": tasks})
+    atomic_text(output / "report.md", markdown(report))
+    atomic_text(output / "review.md", review_markdown(report))
+    atomic_text(output / "agent-tasks.json", json.dumps({"tasks": tasks}, indent=2, ensure_ascii=False) + "\n")
+    atomic_text(output / "report.json", json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+
+
+@contextmanager
+def report_lock(output: Path):
+    with (output / ".report.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def _save_report(project: Project, shards: list[dict], selected: list[str], *,
+                 other_revision_checkpoints: list[dict] | None = None) -> dict:
+    report = aggregate(project, shards, selected)
+    report["scan_progress"] = scan_snapshot(project.manifest, shards, selected)
+    if other_revision_checkpoints:
+        report["other_revision_checkpoints"] = other_revision_checkpoints
+    write_report(project.output, report)
     return report
+
+
+def save_report(project: Project, shards: list[dict], selected: list[str]) -> dict:
+    with report_lock(project.output):
+        return _save_report(project, shards, selected)
+
+
+def saved_path(output: Path, relative: str) -> Path:
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise GapError(f"Invalid saved relative path: {relative!r}.")
+    path = (output / relative).resolve()
+    if ".." in Path(relative).parts or not path.is_relative_to(output.resolve()):
+        raise GapError(f"Saved path escapes the result directory: {relative!r}.")
+    return path
+
+
+def saved_shards(output: Path, manifest: dict, selected: list[str]) -> tuple[list[dict], list[dict]]:
+    revision = hashlib.sha256(json.dumps(manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
+    level = scan_level_from(manifest)
+    index = manifest.get("shard_index", {})
+    shards = []
+    other_revisions = []
+    for focus in selected:
+        recorded = index.get(focus)
+        base = Path("shards") / hashlib.sha256(focus.encode()).hexdigest()[:12]
+        candidates = [recorded] if recorded is not None else [str(base / revision), str(base)]
+        found = False
+        for relative in candidates:
+            directory = saved_path(output, relative)
+            checkpoint = directory / "report.json"
+            if not checkpoint.is_file():
+                continue
+            shard = json.loads(checkpoint.read_text())
+            if not isinstance(shard, dict) or shard.get("schema") != "verus-gap/shard-v2":
+                raise GapError(f"Invalid shard checkpoint: {checkpoint}.")
+            if shard.get("scanner_revision") != revision:
+                if recorded is not None:
+                    progress = manifest.get("scan_progress", {})
+                    if progress.get("state") in {"running", "interrupted", "stopped"} and (
+                        focus != progress.get("active_file")
+                    ):
+                        other_revisions.append({
+                            "file": focus, "checkpoint": str(checkpoint.relative_to(output)),
+                            "scanner_revision": shard.get("scanner_revision"),
+                        })
+                        found = True
+                        break
+                    raise GapError(f"Saved checkpoint has a different scanner identity: {checkpoint}.")
+                continue
+            if shard.get("focus") != focus or scan_level_from(shard) != level:
+                raise GapError(f"Saved checkpoint has a different source scope or scan level: {checkpoint}.")
+            if not all(isinstance(shard.get(key), list) for key in ("scope", "rounds", "observations", "events")):
+                raise GapError(f"Incomplete shard checkpoint: {checkpoint}.")
+            if shard.get("status") not in {"partial", "frontend_clear", "frontier_cleared_after_exclusions"} or (
+                not isinstance(shard.get("stop_reason"), str)
+            ):
+                raise GapError(f"Invalid frontier status in {checkpoint}.")
+            if not all(isinstance(name, str) and name in manifest["active_sources"] for name in shard["scope"]):
+                raise GapError(f"Invalid checking scope in {checkpoint}.")
+            round_numbers = set()
+            for recorded_round in shard["rounds"]:
+                if not isinstance(recorded_round, dict) or type(recorded_round.get("round")) is not int:
+                    raise GapError(f"Invalid completed round in {checkpoint}.")
+                round_numbers.add(recorded_round["round"])
+            if not all(isinstance(event, dict) and isinstance(event.get("kind"), str)
+                       and isinstance(event.get("file"), str) for event in shard["events"]):
+                raise GapError(f"Invalid exclusion/checking events in {checkpoint}.")
+            for record in shard["observations"]:
+                if not isinstance(record, dict) or not all(key in record for key in (
+                    "category", "message", "locations", "related_locations", "rendered",
+                    "confirmed", "macro_expansion", "scope", "source_variant", "round", "evidence",
+                )):
+                    raise GapError(f"Incomplete observation in {checkpoint}.")
+                if not all(isinstance(record[key], str) for key in (
+                    "category", "message", "rendered", "source_variant", "evidence",
+                )) or not all(isinstance(record[key], list) for key in ("locations", "related_locations", "scope")):
+                    raise GapError(f"Invalid observation in {checkpoint}.")
+                if type(record["confirmed"]) is not bool or type(record["macro_expansion"]) is not bool:
+                    raise GapError(f"Invalid observation confirmation in {checkpoint}.")
+                if type(record["round"]) is not int or record["round"] not in round_numbers:
+                    raise GapError(f"Observation refers to an unfinished round in {checkpoint}.")
+                diagnostic = record.get("raw_diagnostic")
+                if diagnostic is not None and (
+                    not isinstance(diagnostic, dict) or not isinstance(diagnostic.get("children", []), list)
+                    or not all(isinstance(child, dict) and isinstance(child.get("message", ""), str)
+                               for child in diagnostic.get("children", []))
+                ):
+                    raise GapError(f"Invalid retained diagnostic in {checkpoint}.")
+                evidence = saved_path(directory, record["evidence"])
+                if not evidence.is_file():
+                    raise GapError(f"Missing retained diagnostic: {evidence}.")
+                if record["confirmed"] and record["category"] in {"language_rejection", "library_specification"}:
+                    confirmation = evidence.parent / "confirmation" / "verus.txt"
+                    if not confirmation.is_file():
+                        raise GapError(f"Missing retained confirmation: {confirmation}.")
+            shard["directory"] = str(directory.relative_to(output))
+            shards.append(shard)
+            found = True
+            break
+        if recorded is not None and not found and manifest.get("scan_progress", {}).get("active_file") != focus:
+            raise GapError(f"Missing saved checkpoint for {focus!r}.")
+    return shards, other_revisions
+
+
+def _refresh_report(output: Path) -> dict:
+    manifest = json.loads((output / "project.json").read_text())
+    if not isinstance(manifest, dict) or manifest.get("schema") != "verus-gap/project-v2":
+        raise GapError("The result directory does not contain an adaptive scan project record.")
+    active = manifest.get("active_sources")
+    selected = manifest.get("selected_files")
+    if not isinstance(active, dict) or not active or not isinstance(selected, list) or not selected:
+        raise GapError("The scan has no captured active-source selection; finish setup before refreshing reports.")
+    if any(not isinstance(name, str) or name not in active for name in selected) or len(set(selected)) != len(selected):
+        raise GapError("The saved source selection is invalid.")
+    if not all(isinstance(manifest.get(key), dict) for key in ("tool_sha256", "verus", "checks")):
+        raise GapError("The saved build/compiler identity is incomplete.")
+    if not isinstance(manifest.get("rust_cfg"), list) or not all(
+        isinstance(value, str) for value in manifest["rust_cfg"]
+    ):
+        raise GapError("The saved compiler configuration is invalid.")
+    if not isinstance(manifest.get("shard_index", {}), dict) or not isinstance(
+        manifest.get("scan_progress", {}), dict
+    ):
+        raise GapError("The saved checkpoint index or scan progress is invalid.")
+    if not all(key in manifest for key in (
+        "input", "package", "baseline_passed", "cargo_args", "workspace_restored",
+    )) or not isinstance(manifest["verus"].get("version"), str):
+        raise GapError("The saved project/control metadata is incomplete.")
+    if not all(isinstance(manifest[key], str) for key in ("input", "package")) or (
+        not isinstance(manifest["cargo_args"], list)
+        or not all(isinstance(value, str) for value in manifest["cargo_args"])
+        or type(manifest["baseline_passed"]) is not bool or type(manifest["workspace_restored"]) is not bool
+    ):
+        raise GapError("The saved project/control metadata is invalid.")
+    scan_level_from(manifest)
+    cfg = Cfg([*manifest["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
+    sources = {}
+    for name, identity in active.items():
+        if not isinstance(name, str) or not isinstance(identity, dict) or not isinstance(identity.get("sha256"), str):
+            raise GapError("The retained source identity is invalid.")
+        original = saved_path(output, str(Path("originals") / name))
+        data = original.read_bytes()
+        if hashlib.sha256(data).hexdigest() != identity["sha256"]:
+            raise GapError(f"Retained original source changed: {name}.")
+        sources[name] = Source(name, data, cfg)
+    shards, other_revisions = saved_shards(output, manifest, selected)
+    for shard in shards:
+        for record in shard["observations"]:
+            for place in [*record["locations"], *record["related_locations"]]:
+                if not isinstance(place, dict) or not isinstance(place.get("file"), str) or (
+                    place["file"] not in sources
+                ) or not all(
+                    key in place for key in ("byte", "line", "column", "source")
+                ):
+                    raise GapError("A saved diagnostic has no valid original source location.")
+                if not all(type(place[key]) is int for key in ("byte", "line", "column")) or (
+                    place["byte"] < 0 or place["line"] < 1 or place["column"] < 1
+                    or not isinstance(place["source"], str)
+                ):
+                    raise GapError("A saved diagnostic has invalid original source coordinates.")
+                if place["byte"] > len(sources[place["file"]].data):
+                    raise GapError("A saved diagnostic points past the retained original source.")
+    project = Project(
+        output=output, workspace=output / "workspace", cwd=output / "workspace",
+        env={}, command=[], sources=sources, manifest=manifest, deadline=float("inf"),
+    )
+    return _save_report(project, shards, selected, other_revision_checkpoints=other_revisions)
+
+
+def refresh_report(output: Path) -> dict:
+    output = output.expanduser().resolve()
+    with report_lock(output):
+        return _refresh_report(output)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="verus-gap report",
+        description="Refresh reports from saved checkpoints without building, probing, or resuming the scan.",
+    )
+    parser.add_argument("result", help="adaptive scan result directory")
+    args = parser.parse_args(argv)
+    output = Path(args.result).expanduser().resolve()
+    try:
+        refresh_report(output)
+    except (GapError, OSError, UnicodeError, json.JSONDecodeError) as error:
+        print(f"error: Could not refresh reports: {error}", file=sys.stderr)
+        return 2
+    print(f"Reports refreshed from saved evidence: {output / 'report.md'}", flush=True)
+    return 0
