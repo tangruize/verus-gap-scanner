@@ -3,7 +3,7 @@
 | Read | For |
 |---|---|
 | [README.md](README.md) | Installation and all command/parameter usage. The quick start is sufficient for normal scans; consult optional sections only as needed. |
-| [Verus Gap skill](.github/skills/verus-gap/SKILL.md) | The investigation workflow: interpreting findings, optional false-positive/root-cause analysis, and evaluating solution paths. |
+| [Verus Gap skill](.github/skills/verus-gap/SKILL.md) | Diagnose user-selected limitations or crashes: false positives, root causes, tested fixes, and upstream contributions. |
 | [Validation notes](doc/VALIDATION.md) | Detailed measurements and audit methodology, only when those are requested. |
 
 Work only on authorized, trusted input. Preserve original sources and retained evidence; do not change production code, configuration, specifications, or trust assumptions without authorization.

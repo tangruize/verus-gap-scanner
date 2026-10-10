@@ -1,67 +1,95 @@
 ---
 name: verus-gap
-description: Investigate source-bound Verus gaps, distinguish false positives and checking boundaries from support gaps, explain root causes, and assess specification, code-workaround, or upstream solution paths.
+description: Diagnose user-selected Verus limitations or crashes, test whether scanner findings are false positives, trace root causes, validate specification/code/compiler fixes, and prepare evidence for upstream contributions.
 ---
 
-# Verus gap investigation
+# Diagnose Verus limitations
 
-Use this skill to identify Rust constructs or library APIs that Verus cannot check in a project's build context. Its role is investigation and interpretation, not implicit authorization to modify the application or Verus. It does not require a particular agent framework.
+Use this skill when a user asks why a particular API, Rust construct, diagnostic, or compiler crash occurs; whether a reported gap is a tool false positive; or what could make that code pass Verus. The scanner's output is evidence to investigate, not the final diagnosis. The core task is to explain the cause, test competing hypotheses, and identify a concrete repair or an actionable upstream contribution.
 
-## Run and summarize
+For scanning commands and parameters, locate the supplied tool's `README.md` and follow it rather than maintaining another usage guide here. Paths there are relative to the tool, not this skill's directory. Reuse existing results when possible. A user who only wants a gap inventory can stop at `report.md`; when diagnosing a limitation, do not stop at restating that report.
 
-Locate the supplied Verus Gap tool or installed executable and its `README.md`. Follow the README's quick start for setup, scanning, and reading the result; consult its optional sections for command/parameter details only as needed. Paths in those instructions are relative to the tool, not this skill's directory. If the tool or its README is missing, request its location rather than guessing commands.
+## Select the question and preserve the evidence
 
-Preserve the user's requested scope and actual build configuration. Use trusted input because Cargo build scripts and procedural macros execute in the scan copy. Start with `report.md`, even on a nonzero exit. For an ordinary inventory, summarize observed language/API groups, representative original locations, and important coverage limits, then stop. Do not automatically recheck every finding or launch deeper investigation for every partial frontier.
+Start from the user's named API, diagnostic, original source location, report group, or crash trace. Establish whether the goal is explanation, a tested workaround, a specification, or a Verus fix. If no target is identifiable, ask which limitation matters instead of analyzing every partial file. Generated setup-task lists are not a substitute for the user's question.
 
-## Optional deeper analysis
+Work in a separate investigation copy within the authorized scope. Preserve original code, reports, compiler/dependency identities, and raw evidence. Use trusted projects because build scripts and procedural macros execute. Prototype candidate changes in that copy when permitted; ask before changing production code, accepting behavioral or trust changes, undertaking substantial extra work, or publishing anything.
 
-Continue when the user requests analysis or a concrete blocker prevents a reliable inventory. Select a bounded set of important or uncertain groups; use existing evidence before adding compiler runs. `agent-tasks.json` can identify a specific unresolved task. Do not run one agent per function.
+## Establish a valid failing case and rule out false positives
 
-### Establish whether the claim is real
+Read the selected group's original source and its exact checking context in `project.json`, `replay.json`, `report.json`, and the relevant shard/round. Inspect the full raw stdout/stderr, run metadata, prepared source, source maps, edits, and confirmation, not only the grouped diagnostic. Use `review.md` for a relevant crash or blocker; it is not required reading for every partial result.
 
-Inspect `project.json`, `replay.json`, `report.json`, and the relevant round's original sources, prepared overlay, source maps, raw `verus.txt`, and confirmation. Check unchanged-Rust, source-preparation, and support controls, together with the recorded compiler, target, features/cfg, and dependency identities.
+Check the unchanged native Rust build, the ordinary-Rust preparation control, Verus support controls, and the recorded compiler, edition, target, features/cfg, generated assets, and dependency versions. Verify that the failing construct actually belongs to the requested checked source. An ignored or excluded item is not a missing library specification.
 
-Confirm that the diagnostic maps to the original checked construct and repeats under the same prepared code and build context. Compare the overlay with the original: a conversion error can repeat just as reliably as a genuine gap. Repetition alone is not sufficient to rule out a false positive.
+Reproduce the recorded failure in the same context before altering it. Compare original and prepared code to test whether annotations, macros, derives, cfg handling, source adaptation, or artifact dispatch introduced the error. Use a minimally annotated original-code control when feasible, preserving its real types and dependencies. Two identical prepared-code failures establish repeatability, not freedom from scanner false positives.
 
-| Evidence | Interpretation and next question |
+| Finding | What must be distinguished |
 |---|---|
-| Native build, imports, generated assets, or dependency artifacts fail | Setup blocker: restore the recorded context, not a different platform or program API |
-| Preparation introduces the rejected construct or changes its meaning | Suspected scanner false positive: investigate the transformation, not application support |
-| A referenced type/function/trait is ignored, excluded, or outside checking | Checking boundary: what remains unchecked, and could it hide later findings? |
-| Verus explicitly rejects an original construct | Candidate language/translation gap: which exact construct or instance is rejected? |
-| An external type/API has no recognized model | Candidate model gap in this configuration: is the needed model absent, inactive, or inapplicable to this instance? |
-| Mode, binding, visibility, or annotation requirements fail | Migration requirement: does supported code need different verification annotations? |
-| Compiler ICE/panic | Compiler failure: retain the trace; do not conclude the whole feature is unsupported |
+| Setup/preparation issue | Missing context or a manufactured error versus a rejection of valid original code |
+| Checking boundary | An item outside checking versus a genuinely missing language/API model; later gaps may remain hidden |
+| Language/translation rejection | The exact unsupported construct, trait instance, or generic combination, not an entire Rust feature |
+| Library-model rejection | A missing model versus one that is inactive, version-mismatched, or inapplicable to this type/trait instance |
+| Migration requirement | Needed supported annotations, modes, visibility, or bindings versus missing Verus support |
+| Compiler failure | An ICE/panic versus an ordinary diagnostic, timeout, killed process, or resource failure |
 
-Warnings alone are not fatal support-gap counts. Use `review.md` only for the relevant failures or unchecked code; do not make users read it routinely or solely because coverage is partial. If controls or attribution are incomplete, label the claim unresolved rather than declaring it genuine or false.
+If a control cannot be established, identify the missing evidence and keep the conclusion unresolved. Warnings alone are not fatal support-gap counts. A genuine compiler panic is a compiler defect even if unsupported or invalid input triggers it; that input should receive an appropriate diagnostic, not a crash.
 
-### Explain the root cause and reproduce only as needed
+## Trace the root cause and minimize the reproducer
 
-Name the precise Rust construct, API, trait instance, or generic combination, and separate it from the broader diagnostic family. A model not recognized in this configuration does not establish that no model exists anywhere. Distinguish missing library specifications from compiler language support and from local items that were never checked.
+Inspect the matching Verus release's source and specifications, not just current documentation or the diagnostic label. For a model failure, follow API/type/trait resolution and look for relevant `vstd` or external specifications, their bounds, cfg requirements, and registration. For a language rejection, locate its diagnostic emission site and inspect the missing translation case and supported neighboring cases. For a crash, follow the stack and failing invariant as described below.
 
-When the saved evidence is insufficient, replay the recorded command in a separate copy. A minimal reduction must retain compiler, edition, target, cfg/features, relevant generic types, and the smallest real dependency closure. Run unchanged Rust first, then reproduce the same construct/API and canonical Verus diagnostic. A different error in the same category is not a successful reduction.
+Trace only the relevant path through macro/attribute rewriting, Rust HIR-to-VIR conversion, mode/trait checking, VIR lowering, erasure, or solver interaction. Explain what assumption or capability is missing and connect it to the user's actual construct. Use source and experiment evidence to distinguish a known cause from a plausible hypothesis; do not merely rename the error.
 
-Keep reduction provenance, source, commands, diagnostics, and controls separate from original evidence. Preserve Verus annotations and Rust derives; do not silently change the target, disable proof lifetime checks, or add assumptions to obtain a cleaner example.
+Reduce the failing input while preserving compiler, edition, target, cfg/features, relevant types, and the smallest real dependency closure. Require the same canonical diagnostic or crash signature and relevant failing frame. A generic nonzero exit or a different error in the same category is not a valid reduction. For a valid-source support claim, retain successful native/preparation controls during reduction.
 
-### Assess solution paths without silently implementing them
+Use focused changes to test competing explanations, such as the same API with a supported type instance, a direct call without the suspect macro adaptation, or an existing applicable model. Keep each experiment's source, command, context, and output separate. Do not delete derives, add assumptions, switch target, or disable proof lifetime checks simply to obtain a cleaner example.
 
-Choose recommendations according to the user's goal: making this project verifiable, producing a reusable specification, or improving Verus support. Diagnose a setup or scanner defect before recommending any application workaround.
+An isolated comparison with a newer Verus version can establish whether the same reproducer is already fixed. Record both toolchains and results; never change the original result's identity or claim a version fixes the problem without reproducing that case.
 
-| Path | When it fits | What to establish |
-|---|---|---|
-| Existing support or configuration | A suitable model or supported construct already exists | Applicability to the recorded version, target, and type/trait instance; no silent toolchain change |
-| Library specification/model | The implementation is available but Verus lacks a usable contract or type model | A reusable, justified specification; distinguish proved obligations from explicitly authorized trust assumptions |
-| Application-code workaround | A small supported alternative can unblock this project | Behavior, panic/error paths, ownership, API, and performance implications; remaining verification boundaries |
-| Upstream Verus improvement | Language/translation support is missing or the compiler fails | A reproducible version-pinned case, precise diagnosis, and a clear distinction between compiler work and model-library work |
+## Develop and test a route to Verus acceptance
 
-Prefer existing supported solutions or reusable specifications over scattered code changes when they meet the same goal. A behavior-preserving workaround can be appropriate when near-term project verification matters most; it is not evidence that Verus has gained support for the original code.
+Recommend a route according to the user's goal, but go beyond a list of possibilities when a small candidate can be tested in the investigation copy. Separate scanner/configuration fixes, specification work, application workarounds, and compiler work:
 
-Compare expected effort, semantic risk, applicability, and verification/trust consequences. If implementing a solution is requested but the intended goal or acceptable behavioral/trust changes are unclear, obtain that decision first. Do not patch production code, change specifications or trust assumptions, or submit upstream issues/patches without authorization. Exclusions and assumed contracts must never be presented as a proved fix.
+| Route | Concrete work and required checks |
+|---|---|
+| Correct a scanner/configuration false positive | Fix the responsible transformation or context capture; retain the original construct and add a regression showing both valid preparation and the intended Verus behavior |
+| Use existing supported annotations or models | Establish applicability to the recorded API/type instance; verify that the original operation is checked rather than ignored |
+| Add a specification/model | Define the relevant abstract state and contracts, including ownership, aliasing, panics, and trait bounds; compare with Rust documentation and implementation, and state any trusted assumptions explicitly |
+| Rewrite application code | Test a small supported alternative; check behavior, error/panic paths, ownership/lifetimes, API, performance, and the actual target as well as Verus acceptance |
+| Improve Verus | Implement the missing case or repair the failing invariant in the responsible compiler/model layer; test intended acceptance or a proper diagnostic, without bypassing mode, lifetime, or soundness checks |
 
-## Present a bounded analysis
+For each candidate, retain the failing baseline and show what changes after the patch. Run the smallest relevant native tests and Verus checks; add a regression for the actual bug and neighboring or negative cases so a fix cannot merely suppress the failure. A specification for external code may be trusted rather than implementation-verified: do not describe an assumed contract as a proved implementation.
 
-For each selected group, state the assessment (support gap, setup/preparation issue, checking boundary, migration work, compiler failure, or unresolved), the root cause and uncertainty, representative original code/diagnostic, and links to retained evidence or a reduction. If solutions are relevant, give the recommended path, alternatives, and their tradeoffs; distinguish recommendations from implemented changes.
+State exactly what "passes" means: the scanner no longer reports the gap, Verus translates/checks the relevant code, or the requested SMT proof obligations succeed. The scanner disables SMT verification, so clearing its frontier does not establish proof success. When proof success is requested, run the relevant verification with SMT enabled and explain any remaining exclusions or trust boundaries.
 
-Keep `report.md` as the normal user entry point. Explain selected/dependency scope, pending or partial coverage, and exclusions without requiring users to read all raw artifacts. Counts are canonical diagnostic/API groups, not unique Rust features or proved functions. Include detailed measurements only when requested.
+If a full fix is too large or depends on an unresolved design choice, provide the smallest tested improvement, the specific missing work, and a reasoned feasibility assessment. Label untested patch sketches as hypotheses. Do not silently replace the requested goal with excluding the code or adding trust.
 
-Never call `frontend_clear`, an exclusion-cleared frontier, exit 0, or repeated errors a correctness proof or exhaustive inventory. Generated declarations and unexamined boundaries can hide gaps; processing all selected files does not establish complete recall. Do not claim source restoration unless the saved result verifies it.
+## Investigate Verus crashes as compiler bugs
+
+Retain the complete raw panic/ICE output and exact command/environment. Grouped crash summaries may omit stack frames. Reproduce in an isolated copy, enable `RUST_BACKTRACE=full`, and use the recorded binary's supported diagnostic/logging options. Do not attribute a frontend-only scan crash to SMT unless the evidence shows solver interaction.
+
+Use the first relevant compiler frame, assertion, or query to locate the exact source at the recorded commit. Inspect its callers and data/state invariants. Test which original construct or preparation change triggers it; distinguish a Verus defect from a scanner transformation defect, rustc/dependency failure, or environment problem.
+
+Evaluate a concrete repair: for example, correct initialization order, handle a missing translation case, or replace an unjustified panic with a source-bound diagnostic. Establish why the repair preserves the intended invariant; simply removing an assertion or ignoring the item is not a fix. Distinguish preventing a crash from adding verification support for the triggering construct.
+
+When feasible within the authorized work, build the matching source using its [build instructions](https://github.com/verus-lang/verus/blob/main/BUILD.md), add a focused `rust_verify_test` regression, and compare the original and patched compiler on the same reproducer. Consult the matching checkout's [architecture](https://github.com/verus-lang/verus/blob/main/source/CODE.md) and [contribution/testing guide](https://github.com/verus-lang/verus/blob/main/CONTRIBUTING.md). The documented targeted test form is `vargo test -p rust_verify_test --test <suite> <test>`; intermediate logs can be enabled with `VERUS_EXTRA_ARGS="--log-all"`. Run log-producing tests individually so they do not overwrite each other's artifacts.
+
+For an upstream recording, Verus provides `--record`; check the chosen version's support and use it on the minimized failing invocation. The resulting zip can contain the entire crate and generated inputs. Create and inspect a non-sensitive, shareable reproducer and obtain permission before sharing; if private inputs cannot be removed, keep the recording local. The official [minimizer guide](https://github.com/verus-lang/verus/blob/main/source/tools/minimizers/README.md) can help, but its interestingness predicate must preserve this failure rather than accept any error.
+
+## Prepare an actionable upstream contribution
+
+Check for an existing issue, discussion, or fix before recommending a new one. Under the [Verus contribution policy](https://github.com/verus-lang/verus/blob/main/CONTRIBUTING.md), actionable bugs belong in [Issues](https://github.com/verus-lang/verus/issues); missing-feature designs and architectural changes should start in [Discussions](https://github.com/verus-lang/verus/discussions). A library-model contribution belongs in the appropriate specification library, not automatically in compiler code.
+
+Prepare local technical handoff evidence: minimal source and provenance, compiler/Rust/target/dependency identities, replay instructions, expected versus actual behavior, complete relevant diagnostics/backtrace, controls, and any tested patch and regression results. Explain the proposed change, behavior impact, verification/trust consequences, remaining limitations, and whether a newer version reproduces it. Redact secrets and nonessential private code without breaking the public reproducer.
+
+Keep a proposed patch focused and make its reproducer a regression. For new language support, explain the required translation and checking semantics and consult upstream before undertaking broad design work. For trusted library models, follow the contribution guide's soundness requirements rather than using permissive contracts to make tests pass.
+
+Do not publish source, recordings, issues, or pull requests without authorization. Follow upstream's current AI-disclosure and human-authorship policy: a human contributor must review the work and write the PR description and subsequent PR discussion comments. Provide technical evidence for that handoff, not an automatically submitted contribution.
+
+## Answer the user's question
+
+Lead with a diagnosis of the selected limitation: genuine support gap, false positive, checking boundary, migration requirement, compiler bug, or unresolved. Give the precise cause with original-code and compiler/specification evidence, not just the report's category.
+
+Present a concrete recommended repair or workaround and its tested result, or state exactly why only a hypothesis is available. Compare application, specification, and Verus-side options when relevant, including behavior, effort, and trust tradeoffs. For a crash, include the failing component, reproducer, likely or tested repair, and the appropriate upstream contribution path.
+
+Link retained evidence and state the tested scope and remaining uncertainty. Keep `report.md` as the user's normal inventory entry point; do not require them to read every raw artifact. Counts, exclusions, frontend clearance, repeated errors, and exit codes are not correctness proofs or exhaustive coverage. Do not claim source restoration or successful verification beyond what the saved experiments establish.

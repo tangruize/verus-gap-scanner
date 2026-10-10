@@ -91,7 +91,7 @@ Locations link to unchanged files under `originals/`, with visible line/column n
 | `project.json` / `replay.json` | Build configuration, toolchain/dependency identities, adaptations, and replay commands |
 | `originals/` / `shards/` | Unchanged sources and every round's raw output, source overlay, edits, and confirmation evidence |
 | `workers/` | Private concurrent scan copies and their replay context |
-| `agent-tasks.json` | Bounded follow-up tasks for an optional agent |
+| `agent-tasks.json` | Generated per-file blocker hints, not diagnoses of individual gaps |
 
 **Exit 0:** no accepted gaps and selected frontiers cleared. **Exit 1:** reproduced gaps found; coverage may still be partial. **Exit 2:** setup/scan failure, interruption, an exhausted budget, or unresolved frontiers without accepted gaps. An exit code is not a proof; inspect both findings and coverage.
 
@@ -120,7 +120,7 @@ Existing Verus-aware dependencies use official Cargo-Verus. Any support-version 
 
 External path dependencies, generated assets, and unusual platform setup may require a self-contained prepared copy. The tool refuses to copy your home/filesystem root or follow symlinks outside the workspace. Failed setup is reported, never relabeled as an application gap.
 
-For AI-assisted investigation, the optional [agent skill](.github/skills/verus-gap/SKILL.md) follows this README for usage and adds false-positive/root-cause analysis and solution-path assessment. A normal terminal scan needs no agent.
+Use the [agent skill](.github/skills/verus-gap/SKILL.md) to diagnose a limitation or Verus crash, investigate possible false positives, test fixes, or prepare upstream contribution evidence. It refers here for scanning commands; a normal terminal scan needs no agent.
 
 ### Other setup options
 
