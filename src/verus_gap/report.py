@@ -6,6 +6,7 @@ import hashlib
 import re
 from collections import Counter
 from pathlib import Path
+from urllib.parse import quote
 
 from .engine import canonical
 from .project import Project, scan_level_from, write_json
@@ -22,6 +23,16 @@ LABELS = {
     "compiler_failure": "Verus compiler failures (not a language-support verdict)",
     "dependency_codegen_blocker": "Dependency artifacts missing executable MIR",
 }
+
+
+def source_link(place: dict) -> str:
+    label = f"{place['file']}:{place['line']}:{place['column']}"
+    backticks = max((len(run) for run in re.findall(r"`+", label)), default=0)
+    delimiter = "`" * (backticks + 1)
+    if backticks:
+        label = f" {label} "
+    target = quote("originals/" + place["file"], safe="/")
+    return f"[{delimiter}{label}{delimiter}]({target}#L{place['line']})"
 
 
 def public_api(record: dict) -> str | None:
@@ -258,7 +269,10 @@ def markdown(report: dict) -> str:
             f"[Manifest patch]({setup['manifest_patch']}); native-after-alignment control: `{'passed' if setup['native_after_alignment']['exit_code'] == 0 else 'failed'}`. "
             "Root probes emit metadata rather than native executables.", "",
         ])
-    lines.extend(["## Reproducible support gaps", ""])
+    lines.extend([
+        "## Reproducible support gaps", "",
+        "Source locations link to the retained original files in `originals/`, with `#L` line anchors. Viewers without line-anchor support still open the file; the line and column remain visible in the link.", "",
+    ])
     accepted = {"language_rejection", "library_specification"}
     for category in ("language_rejection", "library_specification"):
         groups = [group for group in report["groups"] if group["category"] == category]
@@ -279,7 +293,7 @@ def markdown(report: dict) -> str:
             if group["macro_expansion"]:
                 lines.extend(["The diagnostic involves macro expansion; the original invocation is retained.", ""])
             for place in group["locations"]:
-                lines.append(f"- `{place['file']}:{place['line']}:{place['column']}`")
+                lines.append(f"- {source_link(place)}")
             if group["locations"]:
                 lines.extend(["", "```rust", group["locations"][0]["source"].strip(), "```", ""])
             lines.extend(["```text", group["raw_example"].rstrip(), "```", ""])
@@ -306,12 +320,10 @@ def markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def save_report(project: Project, shards: list[dict], selected: list[str]) -> dict:
-    report = aggregate(project, shards, selected)
-    write_json(project.output / "report.json", report)
-    (project.output / "report.md").write_text(markdown(report))
+def review_markdown(report: dict) -> str:
     review = ["# Boundaries and blockers", "",
-              "These diagnostics are not counted as confirmed Rust or library support gaps.", ""]
+              "These diagnostics are not counted as confirmed Rust or library support gaps.", "",
+              "Source links open retained original files in `originals/` using `#L` line anchors; line navigation depends on the viewer.", ""]
     if report["coverage"]["checking_boundary_only_files"]:
         review.extend([
             "Scan level 2 deliberately stopped before further isolation of these checking boundaries. Affected frontiers remain partial; additional selected-source gaps may be hidden. Start a new level-1 scan for continued selected-source exploration.", "",
@@ -321,12 +333,19 @@ def save_report(project: Project, shards: list[dict], selected: list[str]) -> di
             continue
         review.extend([f"## {LABELS.get(group['category'], group['category'])}: {group['message']}", ""])
         review.extend(
-            f"- `{place['file']}:{place['line']}:{place['column']}`"
+            f"- {source_link(place)}"
             for place in group["locations"]
         )
         review.extend(["", "```text", group["raw_example"].rstrip(), "```", "",
                        f"[Raw evidence]({group['evidence'][0]})", ""])
-    (project.output / "review.md").write_text("\n".join(review))
+    return "\n".join(review)
+
+
+def save_report(project: Project, shards: list[dict], selected: list[str]) -> dict:
+    report = aggregate(project, shards, selected)
+    write_json(project.output / "report.json", report)
+    (project.output / "report.md").write_text(markdown(report))
+    (project.output / "review.md").write_text(review_markdown(report))
     tasks = [
         {
             "file": shard["focus"], "reason": shard["stop_reason"], "scan_level": shard["scan_level"],

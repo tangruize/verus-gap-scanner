@@ -1,15 +1,60 @@
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from verus_gap.report import aggregate, language_family, markdown, public_api
+from verus_gap.report import aggregate, language_family, markdown, public_api, review_markdown, source_link
 
 
 class ReportTests(unittest.TestCase):
+    def test_source_link_uses_the_original_file_and_preserves_visible_line_and_column(self):
+        place = {"file": "src/engine/general_purpose/decode.rs", "line": 122, "column": 5}
+        self.assertEqual(
+            source_link(place),
+            "[`src/engine/general_purpose/decode.rs:122:5`]"
+            "(originals/src/engine/general_purpose/decode.rs#L122)",
+        )
+
+    def test_source_link_encodes_reserved_and_unicode_filename_characters(self):
+        cases = (
+            ("src/a b(1)[x]#%.rs", "src/a%20b%281%29%5Bx%5D%23%25.rs"),
+            ("src/\u6570\u636e.rs", "src/%E6%95%B0%E6%8D%AE.rs"),
+        )
+        for file, encoded in cases:
+            with self.subTest(file=file):
+                self.assertEqual(
+                    source_link({"file": file, "line": 12, "column": 3}),
+                    f"[`{file}:12:3`](originals/{encoded}#L12)",
+                )
+
+    def test_source_link_keeps_backticks_in_a_filename_inside_a_code_span(self):
+        self.assertEqual(
+            source_link({"file": "src/ticks``.rs", "line": 2, "column": 1}),
+            "[``` src/ticks``.rs:2:1 ```](originals/src/ticks%60%60.rs#L2)",
+        )
+
+    def test_review_links_original_locations_without_changing_diagnostics(self):
+        report = {
+            "coverage": {"checking_boundary_only_files": 1},
+            "groups": [{
+                "category": "checking_boundary", "message": "cannot use ignored local type",
+                "locations": [{"file": "src/selected.rs", "line": 4, "column": 7}],
+                "raw_example": "unchanged raw diagnostic",
+                "evidence": ["shards/a/round-000/verus.txt"],
+            }],
+        }
+        before = copy.deepcopy(report)
+        text = review_markdown(report)
+        self.assertIn("- [`src/selected.rs:4:7`](originals/src/selected.rs#L4)", text)
+        self.assertIn("unchanged raw diagnostic", text)
+        self.assertIn("[Raw evidence](shards/a/round-000/verus.txt)", text)
+        self.assertIn("deliberately stopped", text)
+        self.assertEqual(report, before)
+
     def test_fast_report_filters_primary_and_related_locations_without_editing_raw_evidence(self):
         source = SimpleNamespace(functions=[], declarations=[])
         project = SimpleNamespace(sources={"selected.rs": source, "dependency.rs": source}, manifest={
@@ -48,6 +93,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(record["locations"], [selected, dependency])
         self.assertEqual(report["outside_scope_evidence"][0]["evidence"], "shards/a/round-000/verus.txt")
         text = markdown(report)
+        self.assertIn("- [`selected.rs:1:1`](originals/selected.rs#L1)", text)
         self.assertIn("Scan level: 1, selected source only", text)
         self.assertNotIn("#### dependency-only", text)
         self.assertNotIn("`dependency.rs:", text)

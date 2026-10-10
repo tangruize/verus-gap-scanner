@@ -44,6 +44,8 @@ Build scripts and macros execute in the copy. Use trusted input and preserve the
 
 Read `report.md`, `report.json`, `review.md`, and `project.json`, even on a nonzero exit. Inspect representative per-round `verus.txt` and the retained source overlay for every diagnostic family.
 
+Source-location links in the Markdown reports point to retained original files under `originals/`, with `#L` line anchors; viewer support determines whether clicking jumps to the line. Keep that directory with the reports. Inspect scan overlays separately when investigating a transformation; do not confuse them with the linked original source.
+
 | Evidence | Interpretation |
 |---|---|
 | `language_rejection` | An explicit Verus translation rejection mapped to checked original source and repeated under the recorded overlay |

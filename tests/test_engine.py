@@ -502,10 +502,23 @@ class RealInventoryTests(unittest.TestCase):
         self.assertNotIn("language_rejection", report["counts"])
         self.assertEqual(report["shards"][0]["scope"], ["src/selected.rs"])
         self.assertEqual(report["shards"][0]["stop_reason"], "focused_dependency_boundary")
+        support = {"language_rejection", "library_specification"}
+        documents = {
+            True: (output / "report.md").read_text(),
+            False: (output / "review.md").read_text(),
+        }
         for group in report["groups"]:
             self.assertTrue(all(place["file"] == "src/selected.rs" for place in group["locations"]))
             if group["category"] == "library_specification":
                 self.assertTrue(group["confirmed"])
+            for place in group["locations"]:
+                self.assertIn(
+                    f"- [`{place['file']}:{place['line']}:{place['column']}`]"
+                    f"(originals/{place['file']}#L{place['line']})",
+                    documents[group["category"] in support],
+                )
+                source = output / "originals" / place["file"]
+                self.assertEqual(source.read_text().splitlines()[place["line"] - 1], place["source"])
         self.assertNotIn("SystemTime", (output / "report.md").read_text())
         self.assertIn("selected source only", (output / "report.md").read_text())
         self.assertFalse(any(event["kind"] == "scope_expansion" for event in report["shards"][0]["events"]))

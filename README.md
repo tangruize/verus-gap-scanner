@@ -65,7 +65,7 @@ Use trusted projects: Cargo build scripts and procedural macros execute in the c
 
 ## Read the result
 
-Open the printed **`report.md`**. Its summary groups language rejections by error family and distinguishes your selected files from added dependency context. Detailed findings use public API names when available, original file locations, source excerpts, and unchanged compiler diagnostics. Unstable compiler definition numbers are normalized only for grouping, and different public APIs are kept separate. Counts are distinct diagnostic/API groups, **not counts of distinct Rust features or proved functions**.
+Open the printed **`report.md`**. Its summary groups language rejections by error family and distinguishes your selected files from added dependency context. Detailed findings use public API names when available, original file locations, source excerpts, and unchanged compiler diagnostics. Source locations in `report.md` and `review.md` are clickable links to the unchanged source copies under `originals/`, with `#L` line anchors and visible line/column numbers. Line navigation depends on your Markdown viewer; keep `originals/` beside the reports when moving them. Unstable compiler definition numbers are normalized only for grouping, and different public APIs are kept separate. Counts are distinct diagnostic/API groups, **not counts of distinct Rust features or proved functions**.
 
 | File | Purpose |
 |---|---|
