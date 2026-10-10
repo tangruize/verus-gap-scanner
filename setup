@@ -19,6 +19,16 @@ try:
     if not python.is_file():
         print("Creating a local Python environment...", flush=True)
         venv.EnvBuilder(with_pip=True).create(environment)
+    pip_check = subprocess.run(
+        [str(python), "-m", "pip", "--version"],
+        capture_output=True, text=True,
+    )
+    if pip_check.returncode:
+        print("Repairing pip in the local Python environment...", flush=True)
+        subprocess.run(
+            [str(python), "-m", "ensurepip", "--upgrade", "--default-pip"],
+            check=True,
+        )
     print("Installing the declared scanner dependencies...", flush=True)
     subprocess.run(
         [str(python), "-m", "pip", "install", "--quiet", "-e", str(root)],

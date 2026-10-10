@@ -4,7 +4,9 @@ Find Rust constructs and library APIs that **the installed Verus cannot check in
 
 ## Install once
 
-Run the commands below from this tool directory. Requires **Python 3.11+ and Rustup/Cargo**. Linux x86-64 is tested; the official installer also supports macOS x86-64/ARM64.
+Run the commands below from this tool directory. Requires **Python 3.11+ with venv support and Rustup/Cargo**. Linux x86-64 is tested; the official installer also supports macOS x86-64/ARM64.
+
+On Ubuntu/Debian, install Python's venv support first: `sudo apt install python3-venv`.
 
 ```bash
 ./setup

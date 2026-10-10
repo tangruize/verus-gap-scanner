@@ -131,6 +131,8 @@ Use the [agent skill](../.github/skills/verus-gap/SKILL.md) to diagnose a limita
 
 ## Other setup options
 
+Python must include `venv` and `ensurepip`; on Ubuntu/Debian, install `python3-venv` before running `./setup`. System-wide pip is not required. If setup fails, read the error, install any missing prerequisites, and rerun the same command. Setup checks its local pip and bootstraps it when an earlier attempt left an incomplete `.venv`; it does not delete existing packages or require you to remove the environment.
+
 Setup validates the official release's published SHA-256 and runs a Verus/vstd/Z3 smoke proof. The chosen release stays fixed until you run setup again.
 
 Already have a complete Verus distribution? Use `./setup --verus /absolute/path/to/verus`. To pin a release, use `./setup --release VERSION`.
