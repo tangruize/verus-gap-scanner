@@ -179,7 +179,10 @@ class VerboseProgress:
 
     def __call__(self, phase: str, details: dict):
         if phase == "pool":
-            self.write(f"[pool] starting {details['jobs']} process workers; dispatched files are not completed files")
+            self.write(
+                f"[pool] starting {details['jobs']} process workers; largest sources first; "
+                "dispatched files are not completed files"
+            )
             return
         if phase == "worker":
             label = f"[worker {details['worker']}/{details['jobs']} pid={details['pid']}]"
@@ -374,10 +377,16 @@ def main(argv: list[str] | None = None) -> int:
         project.save()
         reporting.refresh()
         revision = hashlib.sha256(json.dumps(project.manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
+        dispatched = 0
 
         def start(item: Work):
+            nonlocal dispatched
+            dispatched += 1
             if progress is not None:
-                progress.write(f"[file {item.number + 1}/{len(selected)}] {item.focus}")
+                label = f"dispatch {dispatched}/{len(pending)}" if args.jobs > 1 else (
+                    f"file {item.number + 1}/{len(selected)}"
+                )
+                progress.write(f"[{label}] {item.focus}")
             reporting.start(item.focus, item.directory)
 
         def complete(item: Work, result: dict, *, cached: bool = False):

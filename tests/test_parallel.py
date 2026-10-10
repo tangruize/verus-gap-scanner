@@ -169,6 +169,37 @@ class ParallelTests(unittest.TestCase):
             self.assertTrue(project.manifest["workers_restored"])
             self.assertEqual(len(list((project.output / "workers").glob("*/worker-*/workspace"))), 2)
 
+    def test_pending_work_is_dispatched_largest_first_without_changing_selected_ordinals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            for name, extra in (("a.rs", 0), ("b.rs", 50), ("c.rs", 100)):
+                original = project.sources[name]
+                data = original.data + b" " * extra
+                project.sources[name] = Source(name, data, original.cfg)
+                (project.workspace / name).write_bytes(data)
+            work = self.work(project)
+            starting = mock.Mock()
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
+                results = list(scan(project, work, 2, 2, starting, mock.Mock()))
+            self.assertEqual([call.args[0].focus for call in starting.call_args_list], ["c.rs", "b.rs", "a.rs"])
+            self.assertEqual([call.args[0].number for call in starting.call_args_list], [2, 1, 0])
+            self.assertEqual([item.focus for item in work], ["a.rs", "b.rs", "c.rs"])
+            self.assertEqual(list(project.sources), ["a.rs", "b.rs", "c.rs"])
+            self.assertEqual({item for item, result in results}, set(work))
+            self.assertEqual(project.manifest["parallel_runs"][0]["scheduling"], "largest_source_first")
+            self.assertTrue(project.manifest["workers_restored"])
+
+    def test_equal_sizes_keep_selected_order_and_only_pending_files_are_dispatched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = self.project(temporary)
+            work = self.work(project)
+            starting = mock.Mock()
+            with mock.patch("verus_gap.parallel.worker_main", new=fixture_worker):
+                results = list(scan(project, [work[2], work[0]], 2, 2, starting, mock.Mock()))
+            self.assertEqual([call.args[0] for call in starting.call_args_list], [work[0], work[2]])
+            self.assertEqual({item for item, result in results}, {work[0], work[2]})
+            self.assertNotIn("b.rs", self.contexts(project))
+
     def test_worker_sources_and_captured_paths_are_private_but_dependencies_are_shared(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = self.project(temporary)
@@ -477,7 +508,7 @@ class JobsCliTests(unittest.TestCase):
             def scanning(project, pending, jobs, level, start, reporting):
                 self.assertEqual(jobs, 32)
                 self.assertEqual(level, 2)
-                for item in pending:
+                for item in reversed(pending):
                     start(item)
                     item.directory.mkdir(parents=True)
                     yield item, {"status": "frontend_clear", "stop_reason": "no_remaining_errors"}
@@ -487,11 +518,41 @@ class JobsCliTests(unittest.TestCase):
                 "verus_gap.cli.parallel_scan", side_effect=scanning,
             ), mock.patch("verus_gap.cli.probe") as probing, mock.patch(
                 "verus_gap.cli.save_report", return_value=report,
-            ), redirect_stdout(io.StringIO()):
-                self.assertEqual(main(["fixture", "--out", str(output), "--jobs", "32"]), 0)
+            ), redirect_stdout(io.StringIO()) as messages:
+                self.assertEqual(main(["fixture", "--out", str(output), "--jobs", "32", "--verbose"]), 0)
             preparing.assert_called_once()
             probing.assert_not_called()
             self.assertEqual(project.manifest["jobs"], 32)
+            self.assertEqual(project.manifest["selected_files"], ["a.rs", "b.rs"])
+            self.assertIn("[dispatch 1/2] b.rs", messages.getvalue())
+            self.assertIn("[dispatch 2/2] a.rs", messages.getvalue())
+            self.assertIn("[1/2] b.rs: no_remaining_errors", messages.getvalue())
+            self.assertIn("[2/2] a.rs: no_remaining_errors", messages.getvalue())
+
+    def test_single_worker_keeps_selected_order_and_original_file_progress(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "results"
+            project = SimpleNamespace(
+                output=output, manifest={"tool_sha256": {}}, sources={"a.rs": None, "b.rs": None},
+                deadline=time.monotonic() + 30, save=mock.Mock(), verify_originals=mock.Mock(),
+            )
+
+            def probing(project, focus, directory, **options):
+                directory.mkdir(parents=True)
+                return {"status": "frontend_clear", "stop_reason": "no_remaining_errors", "observations": []}
+
+            report = {"counts": {}, "status": "no_confirmed_limitations", "coverage": {"pending_files": 0, "partial_files": 0}}
+            with mock.patch("verus_gap.cli.prepare", return_value=project), mock.patch(
+                "verus_gap.cli.probe", side_effect=probing,
+            ) as probing, mock.patch("verus_gap.cli.parallel_scan") as scanning, mock.patch(
+                "verus_gap.cli.save_report", return_value=report,
+            ), redirect_stdout(io.StringIO()) as messages:
+                self.assertEqual(main(["fixture", "--out", str(output), "--verbose"]), 0)
+            self.assertEqual([call.args[1] for call in probing.call_args_list], ["a.rs", "b.rs"])
+            scanning.assert_not_called()
+            self.assertIn("[file 1/2] a.rs", messages.getvalue())
+            self.assertIn("[file 2/2] b.rs", messages.getvalue())
+            self.assertNotIn("[dispatch", messages.getvalue())
 
     def test_main_worker_error_keeps_a_stopped_snapshot_instead_of_a_setup_failure_report(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -554,6 +615,7 @@ class ParallelProgressTests(unittest.TestCase):
                 progress("worker", {**base, "stage": "ready", "seconds": 0.7, "sources": 287})
         output = "\n".join(call.args[0] for call in printing.call_args_list)
         self.assertIn("process workers", output)
+        self.assertIn("largest sources first", output)
         self.assertIn("dispatched files are not completed files", output)
         self.assertIn("no reparsing", output)
         self.assertIn("17 files copied", output)
@@ -642,12 +704,14 @@ class RealParallelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             project = self.fixture(root, 32)
+            for number, path in enumerate(sorted((project / "src/selected").glob("f*.rs"))):
+                path.write_text(path.read_text() + "//" + "x" * number + "\n")
             reports = []
             for jobs in (1, 32):
                 output = root / f"jobs-{jobs}"
                 process = subprocess.run(
                     [str(ROOT / "verus-gap"), str(project), "--file", "src/selected/f*.rs",
-                     "--jobs", str(jobs), "--out", str(output)],
+                     "--jobs", str(jobs), "--verbose", "--out", str(output)],
                     capture_output=True, text=True, timeout=120,
                 )
                 self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
@@ -656,6 +720,13 @@ class RealParallelTests(unittest.TestCase):
                 self.assertEqual(report["coverage"]["probed_files"], 32)
                 self.assertEqual(report["coverage"]["pending_files"], 0)
                 self.assertTrue(report["workspace_restored"])
+                self.assertEqual(
+                    [shard["focus"] for shard in report["shards"]],
+                    [f"src/selected/f{number:02d}.rs" for number in range(32)],
+                )
+                if jobs == 32:
+                    self.assertIn("[dispatch 1/32] src/selected/f31.rs", process.stdout)
+                    self.assertIn("[dispatch 2/32] src/selected/f30.rs", process.stdout)
                 reports.append(report)
             serial, parallel = reports
             self.assertEqual(serial["counts"], parallel["counts"])

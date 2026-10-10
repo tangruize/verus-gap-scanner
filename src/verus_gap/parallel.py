@@ -207,6 +207,7 @@ class Workers:
             "directory": str(self.root.relative_to(project.output)), "jobs": jobs,
             "model": "process", "start_method": "spawn", "workspace_restored": False,
             "cached_sources": len(project.sources), "worker_pids": [],
+            "scheduling": "largest_source_first",
         }
         project.manifest.setdefault("parallel_runs", []).append(self.record)
         project.manifest["workers_restored"] = False
@@ -311,7 +312,9 @@ def scan(project: Project, work: list[Work], jobs: int, level: int,
     count = min(jobs, len(work))
     progress("pool", {"jobs": count, "stage": "starting", "model": "process"})
     workers = Workers(project, count, level)
-    remaining = iter(work)
+    remaining = iter(sorted(
+        work, key=lambda item: (-len(project.sources[item.focus].data), item.number),
+    ))
 
     def submit(slot: Slot):
         if time.monotonic() >= project.deadline:
