@@ -202,6 +202,49 @@ class VerboseProgressTests(unittest.TestCase):
         self.assertIn("selected.rs:1:1: " + message, text)
         self.assertIn("confirmed groups: 1 language / 0 models", text)
 
+    def test_mutable_statics_are_announced_and_counted_as_one_readable_group(self):
+        progress = VerboseProgress(["selected.rs"], fast=True)
+        message = (
+            "The verifier does not yet support the following Rust feature: "
+            "Path Def(Static { safety: Safe, mutability: Mut, nested: false }, "
+            "DefId(0:42 ~ fixture[abcd]::FIRST))"
+        )
+        first = self.record(message=message)
+        second = self.record(message=message.replace("FIRST", "SECOND"))
+        records = [first, second]
+        before = copy.deepcopy(records)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.round(progress, [first])
+            self.round(progress, records)
+        text = output.getvalue()
+        self.assertEqual(text.count("[limitation]"), 1)
+        self.assertIn("Mutable static access (`static mut`); global: fixture::FIRST", text)
+        self.assertNotIn("Path Def(Static", text)
+        self.assertIn("confirmed groups: 1 language / 0 models", text)
+        self.assertNotIn("confirmed groups: 2 language", text)
+        self.assertEqual(len(progress.groups), 1)
+        self.assertEqual(len(progress.selected_groups), 1)
+        self.assertEqual(records, before)
+
+    def test_mutable_static_dependency_and_selected_instances_share_one_group(self):
+        progress = VerboseProgress(["selected.rs"], fast=False)
+        message = (
+            "The verifier does not yet support the following Rust feature: "
+            "Path Def(Static { mutability: Mut }, DefId(fixture::DEPENDENCY))"
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.round(progress, [self.record(file="dependency.rs", message=message)])
+            self.round(progress, [self.record(message=message.replace("DEPENDENCY", "SELECTED"))])
+        text = output.getvalue()
+        self.assertEqual(text.count("[limitation]"), 1)
+        self.assertEqual(text.count("[selected-location]"), 1)
+        self.assertIn("global: fixture::DEPENDENCY", text)
+        self.assertIn("global: fixture::SELECTED", text)
+        self.assertIn("selected: 1 language / 0 models", text)
+        self.assertEqual(len(progress.groups), 1)
+
     def test_distinct_public_apis_remain_separate_groups(self):
         progress = VerboseProgress(["selected.rs"], fast=True)
         message = "`core::sync::atomic::impl&%1%default%load` is not supported"

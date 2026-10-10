@@ -18,8 +18,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from verus_gap.project import write_json
 from verus_gap.report import (
-    aggregate, atomic_text, language_family, main, markdown, public_api, refresh_report,
-    review_markdown, save_report, source_link, write_report,
+    MUTABLE_STATIC_ACCESS, aggregate, atomic_text, group_key, language_family, main, markdown,
+    mutable_static_name, public_api, refresh_report, review_markdown, save_report, source_link,
+    write_report,
 )
 from verus_gap.source import Cfg, Source
 
@@ -477,6 +478,146 @@ class ReportTests(unittest.TestCase):
         ), "Unsizing coercions")
         self.assertEqual(language_family("Verus does not support this cast: `usize` to `*mut u8`"),
                          "Pointer casts")
+
+    def static_record(self, name, file="selected.rs", **changes):
+        message = (
+            "The verifier does not yet support the following Rust feature: "
+            "Path Def(Static { safety: Safe, mutability: Mut, nested: false }, "
+            f"DefId(0:42 ~ fixture[abcd]::{name}))"
+        )
+        return {
+            "category": "language_rejection", "level": "error", "message": message,
+            "rendered": f"error: {message}\n",
+            "locations": [{"file": file, "byte": 0, "line": 1, "column": 1, "source": f"{name} = value;"}],
+            "related_locations": [], "confirmed": True, "macro_expansion": False,
+            "raw_diagnostic": None, "scope": ["selected.rs", "dependency.rs"],
+            "source_variant": "prepared", "round": 0, "evidence": "round-000/verus.txt", **changes,
+        }
+
+    def static_report(self, records, level=2):
+        source = SimpleNamespace(functions=[], declarations=[])
+        project = SimpleNamespace(sources={"selected.rs": source, "dependency.rs": source}, manifest={
+            "input": "fixture", "package": "fixture", "verus": {"version": "fixture"}, "baseline_passed": True,
+            "cargo_args": [], "checks": {"proof_lifetimes": True}, "workspace_restored": True,
+            "scan_level": level,
+        })
+        shard = {
+            "observations": records, "events": [], "focus": "selected.rs", "directory": "shards/a",
+            "scope": ["selected.rs", "dependency.rs"], "status": "partial", "stop_reason": "unresolved_frontier",
+            "scan_level": level,
+        }
+        return aggregate(project, [shard], ["selected.rs"])
+
+    def test_mutable_statics_share_one_group_with_per_global_evidence(self):
+        first = self.static_record("FIRST")
+        second = self.static_record("SECOND", locations=[{
+            "file": "selected.rs", "byte": 12, "line": 2, "column": 1, "source": "SECOND = value;",
+        }])
+        repeated = self.static_record(
+            "FIRST", round=1, evidence="round-001/verus.txt", macro_expansion=True,
+            message=first["message"].replace("0:42", "0:99").replace("abcd", "ffff"),
+        )
+        records = [second, first, repeated]
+        before = copy.deepcopy(records)
+        report = self.static_report(records)
+        self.assertEqual(report["counts"], {"language_rejection": 1})
+        self.assertEqual(report["selected_scope_counts"], report["counts"])
+        self.assertEqual(report["language_families"], {"Mutable static access": 1})
+        group = report["groups"][0]
+        self.assertEqual(group["message"], MUTABLE_STATIC_ACCESS)
+        self.assertEqual(len(group["locations"]), 2)
+        self.assertEqual(len(group["contexts"]), 2)
+        self.assertTrue(group["macro_expansion"])
+        self.assertEqual([instance["name"] for instance in group["instances"]], ["fixture::FIRST", "fixture::SECOND"])
+        a, b = group["instances"]
+        self.assertEqual(a["evidence"], ["shards/a/round-000/verus.txt", "shards/a/round-001/verus.txt"])
+        self.assertEqual(len(a["contexts"]), 2)
+        self.assertEqual(a["locations"], first["locations"])
+        self.assertEqual(b["locations"], second["locations"])
+        self.assertEqual(a["raw_example"], first["rendered"])
+        self.assertEqual(b["raw_example"], second["rendered"])
+        self.assertIn("DefId(fixture::FIRST)", a["message"])
+        self.assertEqual(a["selected_locations"], 1)
+        self.assertEqual(b["dependency_locations"], 0)
+        text = markdown(report)
+        self.assertEqual(text.count(f"#### {MUTABLE_STATIC_ACCESS}"), 1)
+        self.assertNotIn("#### The verifier does not yet support the following Rust feature: Path Def(Static", text)
+        self.assertIn("| Mutable static access | 1 |", text)
+        self.assertIn("2 affected global(s); 2 primary occurrence(s)", text)
+        self.assertIn("| `fixture::FIRST` | [`selected.rs:1:1`](originals/selected.rs#L1)", text)
+        self.assertIn("| `fixture::SECOND` | [`selected.rs:2:1`](originals/selected.rs#L2)", text)
+        self.assertIn(first["rendered"].rstrip(), text)
+        self.assertNotIn(second["rendered"].rstrip(), text)
+        with tempfile.TemporaryDirectory() as temporary:
+            write_report(Path(temporary), report)
+            saved = json.loads((Path(temporary) / "report.json").read_text())
+        self.assertEqual(saved["groups"][0]["instances"], group["instances"])
+        self.assertEqual(records, before)
+
+    def test_mutable_static_instances_follow_primary_scope_filtering(self):
+        selected = self.static_record("SELECTED", related_locations=[{
+            "file": "dependency.rs", "byte": 2, "line": 2, "column": 1, "source": "related declaration",
+        }])
+        dependency = self.static_record("DEPENDENCY", file="dependency.rs")
+        records = [dependency, selected]
+        before = copy.deepcopy(records)
+        focused = self.static_report(records)
+        group = focused["groups"][0]
+        self.assertEqual([instance["name"] for instance in group["instances"]], ["fixture::SELECTED"])
+        self.assertEqual(group["related_locations"], [])
+        self.assertEqual(group["instances"][0]["related_locations"], [])
+        self.assertEqual(focused["coverage"]["outside_scope_diagnostics"], 1)
+        self.assertNotIn("fixture::DEPENDENCY", markdown(focused))
+        expanded = self.static_report(records, level=0)
+        group = expanded["groups"][0]
+        self.assertEqual(expanded["counts"], {"language_rejection": 1})
+        self.assertEqual(expanded["selected_scope_counts"], {"language_rejection": 1})
+        self.assertEqual(group["dependency_locations"], 1)
+        self.assertEqual(group["related_locations"], selected["related_locations"])
+        self.assertEqual([instance["name"] for instance in group["instances"]], [
+            "fixture::DEPENDENCY", "fixture::SELECTED",
+        ])
+        self.assertEqual(group["instances"][0]["selected_locations"], 0)
+        self.assertEqual(group["instances"][1]["related_locations"], selected["related_locations"])
+        self.assertEqual(records, before)
+
+    def test_unconfirmed_static_diagnostics_are_not_instances_of_a_confirmed_group(self):
+        confirmed = self.static_record("CONFIRMED")
+        unconfirmed = self.static_record("UNCONFIRMED", confirmed=False)
+        report = self.static_report([confirmed, unconfirmed])
+        self.assertEqual(report["counts"], {"language_rejection": 1, "unconfirmed_support_diagnostic": 1})
+        accepted = next(group for group in report["groups"] if group["category"] == "language_rejection")
+        self.assertEqual([instance["name"] for instance in accepted["instances"]], ["fixture::CONFIRMED"])
+        rejected = next(group for group in report["groups"] if group["category"] == "unconfirmed_support_diagnostic")
+        self.assertNotIn("instances", rejected)
+        self.assertIn("fixture::UNCONFIRMED", rejected["message"])
+        self.assertNotIn("fixture::UNCONFIRMED", markdown(report))
+        self.assertIn(unconfirmed["rendered"].rstrip(), review_markdown(report))
+
+    def test_static_presentation_does_not_merge_declarations_immutable_or_unknown_statics(self):
+        mutable = self.static_record("MUTABLE")
+        declaration = dict(mutable, message="Verus does not support 'static mut'")
+        self.assertNotEqual(group_key(mutable), group_key(declaration))
+        self.assertEqual(language_family(declaration["message"]), "Mutable static declarations")
+        for detail in (
+            "Path Def(Static { mutability: Not }, DefId(fixture::ONE))",
+            "Path Def(Static { mutability: Mutable }, DefId(fixture::ONE))",
+            "Path Def(Static, DefId(fixture::ONE))",
+            "Path Def(Static { mutability: Mut }, DefId(0:42))",
+            "Path Def(Static { mutability: Mut }, DefId( ))",
+        ):
+            with self.subTest(detail=detail):
+                first = dict(mutable, message=detail)
+                second = dict(first, message=detail.replace("ONE", "TWO"))
+                self.assertIsNone(mutable_static_name(detail))
+                self.assertNotEqual(group_key(first), group_key(mutable))
+                if "ONE" in detail:
+                    self.assertNotEqual(group_key(first), group_key(second))
+        self.assertEqual(language_family(
+            "Path Def(Static { mutability: Mutable }, DefId(fixture::ONE))"
+        ), "Static access")
+        self.assertEqual(group_key(dict(mutable, category="library_specification"))[1],
+                         mutable["message"].replace("DefId(0:42 ~ fixture[abcd]::", "DefId(fixture::"))
 
     def test_same_internal_method_name_does_not_merge_distinct_public_apis(self):
         def record(api, file):

@@ -15,7 +15,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from verus_gap.engine import DependencyIndex, State, canonical, classify, compiler_panic, dependencies, execute, parse_output, probe
+from verus_gap.engine import (
+    DependencyIndex, State, canonical, classify, compiler_panic, dependencies, execute,
+    parse_output, probe, record_key,
+)
 from verus_gap.gap import TimeBudgetExhausted, run
 from verus_gap.source import Cfg, Source
 
@@ -453,6 +456,21 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(canonical(first), canonical(second))
         self.assertIn("kernel::hal::GDT_STORAGE", canonical(first))
         self.assertNotEqual(canonical(first), canonical(second.replace("GDT_STORAGE", "HEAP_STORAGE")))
+
+    def test_mutable_static_confirmation_fingerprints_keep_individual_globals(self):
+        message = (
+            "The verifier does not yet support the following Rust feature: "
+            "Path Def(Static { safety: Safe, mutability: Mut, nested: false }, "
+            "DefId(0:42 ~ fixture[abcd]::FIRST))"
+        )
+        first = {
+            "category": "language_rejection", "level": "error", "message": message,
+            "locations": [{"file": "lib.rs", "byte": 12}],
+        }
+        second = dict(first, message=message.replace("FIRST", "SECOND"))
+        repeated = dict(first, message=message.replace("0:42", "0:99").replace("abcd", "ffff"))
+        self.assertNotEqual(record_key(first), record_key(second))
+        self.assertEqual(record_key(first), record_key(repeated))
 
     def record(self, message: str, **kwargs):
         return dict(level="error", message=message, **kwargs)

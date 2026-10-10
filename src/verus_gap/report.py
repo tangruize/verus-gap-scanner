@@ -34,6 +34,8 @@ LABELS = {
     "dependency_codegen_blocker": "Dependency artifacts missing executable MIR",
 }
 
+MUTABLE_STATIC_ACCESS = "Mutable static access (`static mut`)"
+
 
 def source_link(place: dict) -> str:
     label = f"{place['file']}:{place['line']}:{place['column']}"
@@ -62,10 +64,32 @@ def public_api(record: dict) -> str | None:
     return None
 
 
+def mutable_static_name(message: str) -> str | None:
+    detail = canonical(message).removeprefix(
+        "The verifier does not yet support the following Rust feature: "
+    )
+    match = re.fullmatch(r"Path Def\(Static\s*\{([^}]*)\},\s*DefId\(([^)]+)\)\)", detail)
+    if match and re.search(r"\bmutability:\s*Mut\b", match[1]):
+        name = match[2].strip()
+        if name and not re.fullmatch(r"\d+:\d+", name):
+            return name
+    return None
+
+
+def group_key(record: dict, category: str | None = None) -> tuple[str, str, str | None]:
+    """Presentation key only; engine confirmation retains individual diagnostics."""
+    category = record["category"] if category is None else category
+    if category == "language_rejection" and mutable_static_name(record["message"]) is not None:
+        return category, MUTABLE_STATIC_ACCESS, None
+    return category, canonical(record["message"]), public_api(record)
+
+
 def language_family(message: str) -> str:
+    if message == MUTABLE_STATIC_ACCESS:
+        return "Mutable static access"
     detail = message.removeprefix("The verifier does not yet support the following Rust feature: ")
     if detail.startswith("Path Def(Static"):
-        return "Mutable static access" if "mutability: Mut" in detail else "Static access"
+        return "Mutable static access" if re.search(r"\bmutability:\s*Mut\b", detail) else "Static access"
     if message == "Verus does not support 'static mut'":
         return "Mutable static declarations"
     if detail.startswith("unsizing operation"):
@@ -101,35 +125,53 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
             category = record["category"]
             if category in {"language_rejection", "library_specification"} and not record["confirmed"]:
                 category = "unconfirmed_support_diagnostic"
-            api = public_api(record)
-            key = (category, canonical(record["message"]), api)
+            key = group_key(record, category)
             group = groups.setdefault(key, {
                 "id": hashlib.sha256(repr(key).encode()).hexdigest()[:12],
                 "category": category, "message": key[1], "locations": [], "related_locations": [],
                 "evidence": [], "raw_example": record["rendered"],
                 "confirmed": record["confirmed"], "macro_expansion": record["macro_expansion"],
                 "contexts": [],
-                "api": api,
+                "api": key[2],
                 "family": language_family(key[1]) if category == "language_rejection" else None,
             })
-            for field, places in (("locations", locations), ("related_locations", related_locations)):
-                for place in places:
-                    if place not in group[field]:
-                        group[field].append(place)
+            entries = [group]
+            name = mutable_static_name(record["message"]) if category == "language_rejection" else None
+            if name is not None:
+                instances = group.setdefault("instances", [])
+                instance = next((item for item in instances if item["name"] == name), None)
+                if instance is None:
+                    instance = {
+                        "name": name, "message": canonical(record["message"]),
+                        "locations": [], "related_locations": [], "evidence": [], "contexts": [],
+                        "raw_example": record["rendered"], "macro_expansion": record["macro_expansion"],
+                    }
+                    instances.append(instance)
+                entries.append(instance)
             evidence = str(Path(shard["directory"]) / record["evidence"])
-            if evidence not in group["evidence"]:
-                group["evidence"].append(evidence)
             context = {
                 "focus": shard["focus"], "scope": record["scope"],
                 "variant": record["source_variant"], "round": record["round"],
             }
-            if context not in group["contexts"]:
-                group["contexts"].append(context)
+            for entry in entries:
+                if name is not None:
+                    entry["macro_expansion"] |= record["macro_expansion"]
+                for field, places in (("locations", locations), ("related_locations", related_locations)):
+                    for place in places:
+                        if place not in entry[field]:
+                            entry[field].append(place)
+                if evidence not in entry["evidence"]:
+                    entry["evidence"].append(evidence)
+                if context not in entry["contexts"]:
+                    entry["contexts"].append(context)
     for group in groups.values():
-        for field in ("locations", "related_locations"):
-            group[field].sort(key=lambda place: (place["file"], place["line"], place["column"]))
-        group["selected_locations"] = sum(place["file"] in selected_set for place in group["locations"])
-        group["dependency_locations"] = len(group["locations"]) - group["selected_locations"]
+        instances = group.get("instances", [])
+        instances.sort(key=lambda instance: instance["name"])
+        for entry in [group, *instances]:
+            for field in ("locations", "related_locations"):
+                entry[field].sort(key=lambda place: (place["file"], place["line"], place["column"]))
+            entry["selected_locations"] = sum(place["file"] in selected_set for place in entry["locations"])
+            entry["dependency_locations"] = len(entry["locations"]) - entry["selected_locations"]
     grouped = sorted(groups.values(), key=lambda group: (group["category"], group["api"] or group["message"]))
     confirmed = [
         group for group in grouped
@@ -336,7 +378,7 @@ def markdown(report: dict) -> str:
         *([
             "**Boundary-only early stopping:** level 2 stops before further isolation when the current errors are only checking boundaries. Such frontiers remain partial, with their unresolved diagnostics retained. Later gaps in the selected source may still be hidden; early stopping does not weaken the repeated-confirmation requirement for accepted findings.", "",
         ] if level == 2 else []),
-        "These are observed compatibility gaps, not a proof or exhaustive feature inventory. Counts are distinct diagnostic/API groups, not unique Rust features. Each accepted support diagnostic was reproduced twice in the same recorded checking context. File shards retain the full Rust build context, but local/generated items may remain outside Verus checking; those boundaries are not counted as library gaps. Later passes explicitly exclude rejected bodies or declarations. Raw diagnostics, source snapshots, and every patch are retained.",
+        "These are observed compatibility gaps, not a proof or exhaustive feature inventory. Counts are distinct diagnostic/API groups, not unique Rust features. Mutable static accesses share one group, with affected globals listed separately. Each accepted support diagnostic was reproduced twice in the same recorded checking context. File shards retain the full Rust build context, but local/generated items may remain outside Verus checking; those boundaries are not counted as library gaps. Later passes explicitly exclude rejected bodies or declarations. Raw diagnostics, source snapshots, and every patch are retained.",
         "", "## At a glance", "",
         f"Support groups with a primary location in your selected files: "
         f"**{report['selected_scope_counts'].get('language_rejection', 0)} language/translation, "
@@ -391,8 +433,10 @@ def markdown(report: dict) -> str:
         if not groups:
             lines.extend(["None observed. This does not imply complete support.", ""])
         for group in groups:
+            instances = group.get("instances", [])
             lines.extend([
                 f"#### {('`' + group['api'] + '` (model not recognized)') if group.get('api') else group['message']}", "",
+                (f"{len(instances)} affected global(s); " if instances else "") +
                 f"{len(group['locations'])} primary occurrence(s); "
                 f"{len(group['contexts'])} recorded checking context(s).", "",
             ])
@@ -403,12 +447,24 @@ def markdown(report: dict) -> str:
                 ])
             if group["macro_expansion"]:
                 lines.extend(["The diagnostic involves macro expansion; the original invocation is retained.", ""])
-            for place in group["locations"]:
-                lines.append(f"- {source_link(place)}")
-            if group["locations"]:
-                lines.extend(["", "```rust", group["locations"][0]["source"].strip(), "```", ""])
-            lines.extend(["```text", group["raw_example"].rstrip(), "```", ""])
-            evidence = group["evidence"][0]
+            if instances:
+                lines.extend([
+                    "| Global variable | Original source locations | Evidence |",
+                    "|---|---|---|",
+                ])
+                for instance in instances:
+                    locations = "; ".join(source_link(place) for place in instance["locations"])
+                    lines.append(
+                        f"| `{instance['name']}` | {locations} | [raw]({instance['evidence'][0]}) |"
+                    )
+                lines.append("")
+            else:
+                lines.extend(f"- {source_link(place)}" for place in group["locations"])
+            example = instances[0] if instances else group
+            if example["locations"]:
+                lines.extend(["", "```rust", example["locations"][0]["source"].strip(), "```", ""])
+            lines.extend(["```text", example["raw_example"].rstrip(), "```", ""])
+            evidence = example["evidence"][0]
             lines.extend([f"[Raw evidence]({evidence}); all contexts and related spans are in `report.json`.", ""])
     lines.extend(["## Not counted as support gaps", "", "| Category | Distinct messages |", "|---|---:|"])
     for category, count in sorted(report["counts"].items()):

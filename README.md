@@ -78,7 +78,7 @@ Concurrency and verbosity do not change the selected scope or confirmation stand
 
 ### Evidence and exit codes
 
-`report.md` groups language rejections by error family and library/model gaps by public API, separating selected-source and dependency findings. Counts are diagnostic/API groups, not distinct Rust features or proved functions.
+`report.md` groups language rejections by error family and library/model gaps by public API, separating selected-source and dependency findings. Mutable static accesses share one group, with each affected global's locations and raw evidence listed separately. Counts are diagnostic/API groups, not distinct Rust features or proved functions.
 
 **`review.md` is optional troubleshooting material**, not routine reading. Open it when investigating a setup/compiler failure or why particular code remains unchecked; a partial scan alone does not require reading it. The other files below retain evidence for deeper analysis and replay.
 

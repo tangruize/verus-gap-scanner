@@ -13,11 +13,13 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .engine import canonical, probe
+from .engine import probe
 from .gap import GapError
 from .parallel import Work, scan as parallel_scan
 from .project import DEFAULT_SCAN_LEVEL, Project, prepare, resume, scan_level_from, write_json
-from .report import atomic_text, main as report_main, public_api, report_lock, save_report
+from .report import (
+    atomic_text, group_key, main as report_main, mutable_static_name, report_lock, save_report,
+)
 
 
 class ReportProgress:
@@ -157,8 +159,7 @@ class VerboseProgress:
             ]
             if not locations:
                 continue
-            api = public_api(record)
-            key = (record["category"], canonical(record["message"]), api)
+            key = group_key(record)
             new_group = key not in self.groups
             self.groups.add(key)
             selected_locations = [place for place in locations if place["file"] in self.selected]
@@ -170,10 +171,15 @@ class VerboseProgress:
                 scope = "selected" if selected_locations else "dependency"
                 category = "language" if record["category"] == "language_rejection" else "model"
                 label = "limitation" if new_group else "selected-location"
+                message = record["message"]
+                name = mutable_static_name(message) if record["category"] == "language_rejection" else None
+                if name is not None:
+                    message = f"{key[1]}; global: {name}"
                 self.write(
                     f"[{label}][{category}][{scope}] "
-                    f"{place['file']}:{place['line']}:{place['column']}: {record['message']}"
+                    f"{place['file']}:{place['line']}:{place['column']}: {message}"
                 )
+                api = key[2]
                 if api:
                     self.write(f"  API: {api}")
 
