@@ -25,8 +25,10 @@ class PerformanceTests(unittest.TestCase):
             "locations": [{"file": "lib.rs", "byte": byte}], "related_locations": [],
         }
 
-    def run_rounds(self, outputs: list[list[dict]], rounds: int):
-        result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+    def run_rounds(self, outputs: list[list[dict]], rounds: int, progress=None,
+                   scan_level: int = 1, result: dict | None = None):
+        if result is None:
+            result = {"exit_code": 1, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
         project = SimpleNamespace(
             manifest={"tool_sha256": {}}, sources={}, deadline=time.monotonic() + 30,
             verify_originals=mock.Mock(),
@@ -39,8 +41,125 @@ class PerformanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "verus_gap.engine.execute", side_effect=[(result, records, "") for records in outputs],
         ) as execute, mock.patch("verus_gap.engine.refine", side_effect=advance):
-            report = probe(project, "lib.rs", Path(directory), max_rounds=rounds, expand_scope=False)
+            report = probe(
+                project, "lib.rs", Path(directory), max_rounds=rounds,
+                scan_level=scan_level, progress=progress,
+            )
         return report, execute.call_count
+
+    def boundary(self):
+        return dict(
+            self.support(), category="checking_boundary",
+            message="cannot use function `fixture::helper::value` which is ignored because it is external.",
+        )
+
+    def test_level_2_stops_at_boundary_only_errors_without_further_isolation(self):
+        boundary = self.boundary()
+        summary = dict(boundary, category="compiler_summary", message="aborting due to 1 previous error")
+        report, calls = self.run_rounds([[boundary, summary]], 2, scan_level=2)
+        self.assertEqual(calls, 1)
+        self.assertEqual(report["scan_level"], 2)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["stop_reason"], "checking_boundary_only")
+        self.assertTrue(report["dependency_boundary_limited"])
+        self.assertTrue(report["workspace_restored"])
+        self.assertFalse(report["complete_inventory"])
+        self.assertEqual(report["events"], [])
+        self.assertEqual(len(report["rounds"]), 1)
+        self.assertEqual(report["observations"][0]["message"], boundary["message"])
+        self.assertFalse(report["rounds"][0]["confirmation_performed"])
+
+    def test_level_2_confirms_support_before_stopping_on_a_later_boundary_only_round(self):
+        support, boundary = self.support(), self.boundary()
+        progress = mock.Mock()
+        report, calls = self.run_rounds(
+            [[support, boundary], [support, boundary], [boundary]], 3, progress, scan_level=2,
+        )
+        self.assertEqual(calls, 3)
+        self.assertEqual(report["stop_reason"], "checking_boundary_only")
+        self.assertTrue(report["observations"][0]["confirmed"])
+        self.assertEqual(report["observations"][0]["evidence"], "round-000/verus.txt")
+        completed = [call.args[1] for call in progress.call_args_list if call.args[0] == "round"]
+        self.assertTrue(completed[0]["confirmation_performed"])
+        self.assertEqual(completed[1]["observations"], [])
+        self.assertEqual(len(report["rounds"]), 2)
+
+    def test_level_1_continues_past_a_boundary_that_can_hide_a_later_support_gap(self):
+        boundary, support = self.boundary(), self.support()
+        outputs = [[boundary], [support], [support]]
+        focused, focused_calls = self.run_rounds(outputs, 2, scan_level=1)
+        fast, fast_calls = self.run_rounds(outputs, 2, scan_level=2)
+        self.assertEqual(focused_calls, 3)
+        self.assertTrue(focused["observations"][1]["confirmed"])
+        self.assertEqual(fast_calls, 1)
+        self.assertEqual(fast["stop_reason"], "checking_boundary_only")
+        self.assertTrue(all(record["category"] == "checking_boundary" for record in fast["observations"]))
+
+    def test_level_2_does_not_early_stop_with_non_boundary_errors_or_instrumentation_warnings(self):
+        boundary = self.boundary()
+        for category in (
+            "language_rejection", "library_specification", "migration_requirement",
+            "rust_or_wrapper_blocker", "checking_scope_artifact", "dependency_codegen_blocker",
+            "compiler_failure", "instrumentation_failure",
+        ):
+            other = dict(
+                self.support(), category=category,
+                level="warning" if category == "instrumentation_failure" else "error",
+            )
+            with self.subTest(category=category):
+                report, _ = self.run_rounds(
+                    [[boundary, other], [boundary, other]], 1, scan_level=2,
+                )
+                self.assertEqual(report["stop_reason"], "round_limit")
+
+    def test_level_2_boundary_warning_does_not_create_an_error_frontier(self):
+        boundary = dict(self.boundary(), level="warning")
+        result = {"exit_code": 0, "seconds": 0.1, "timed_out": False, "stderr": "", "stdout": ""}
+        report, calls = self.run_rounds([[boundary]], 1, scan_level=2, result=result)
+        self.assertEqual(calls, 1)
+        self.assertEqual(report["status"], "frontend_clear")
+        self.assertEqual(report["stop_reason"], "no_remaining_errors")
+        self.assertFalse(report["dependency_boundary_limited"])
+
+    def test_level_2_keeps_timeout_and_compiler_failure_stop_policies(self):
+        boundary = self.boundary()
+        timeout = {"exit_code": 1, "seconds": 0.1, "timed_out": True, "stderr": "", "stdout": ""}
+        report, calls = self.run_rounds([[boundary]], 1, scan_level=2, result=timeout)
+        self.assertEqual(calls, 1)
+        self.assertEqual(report["stop_reason"], "per_run_timeout")
+        panic = dict(timeout, timed_out=False, stderr="thread 'rustc' (42) panicked at vir/src/traits.rs:1:1:\n")
+        report, calls = self.run_rounds([[boundary], [boundary]], 1, scan_level=2, result=panic)
+        self.assertEqual(calls, 2)
+        self.assertEqual(report["stop_reason"], "round_limit")
+        self.assertTrue(report["rounds"][0]["confirmation_performed"])
+        self.assertTrue(any(record["category"] == "compiler_failure" for record in report["observations"]))
+
+    def test_progress_does_not_change_observations_states_or_compiler_calls(self):
+        support = self.support()
+        quiet, quiet_calls = self.run_rounds([[support], [support], [support]], 2)
+        progress = mock.Mock()
+        verbose, verbose_calls = self.run_rounds([[support], [support], [support]], 2, progress)
+        self.assertEqual(quiet, verbose)
+        self.assertEqual(quiet_calls, verbose_calls)
+        phases = [call.args[0] for call in progress.call_args_list]
+        self.assertEqual(phases, [
+            "restore", "probe", "confirmation", "round", "action", "probe", "round", "action",
+        ])
+        completed = [call.args[1] for call in progress.call_args_list if call.args[0] == "round"]
+        self.assertTrue(completed[0]["observations"][0]["confirmed"])
+        self.assertEqual(completed[1]["observations"], [])
+        self.assertEqual(progress.call_args_list[0].args[1]["observations"], [])
+
+    def test_progress_never_announces_unconfirmed_stored_observations(self):
+        support = self.support()
+        progress = mock.Mock()
+        report, calls = self.run_rounds([[support], [], [support], [support]], 2, progress)
+        self.assertEqual(calls, 4)
+        self.assertFalse(report["observations"][0]["confirmed"])
+        self.assertTrue(all(
+            not call.args[1]["observations"]
+            for call in progress.call_args_list if call.args[0] == "round"
+        ))
 
     def test_already_accepted_diagnostic_does_not_reconfirm_another_overlay(self):
         support = self.support()
@@ -56,11 +175,15 @@ class PerformanceTests(unittest.TestCase):
 
     def test_same_diagnostic_at_a_new_location_still_requires_confirmation(self):
         first, second = self.support(), self.support(1)
-        report, calls = self.run_rounds([[first], [first], [first, second], [first, second]], 2)
-        self.assertEqual(calls, 4)
-        self.assertTrue(all(record["confirmed"] for record in report["observations"]))
-        self.assertTrue(report["rounds"][1]["confirmation_performed"])
-        self.assertEqual(report["observations"][1]["round"], 1)
+        for level in (1, 2):
+            with self.subTest(level=level):
+                report, calls = self.run_rounds(
+                    [[first], [first], [first, second], [first, second]], 2, scan_level=level,
+                )
+                self.assertEqual(calls, 4)
+                self.assertTrue(all(record["confirmed"] for record in report["observations"]))
+                self.assertTrue(report["rounds"][1]["confirmation_performed"])
+                self.assertEqual(report["observations"][1]["round"], 1)
 
     def test_unconfirmed_observation_never_suppresses_a_later_confirmation(self):
         support = self.support()
@@ -124,7 +247,7 @@ class ClassificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "verus_gap.engine.execute", return_value=(result, [support, warning], ""),
         ) as execute:
-            report = probe(project, "lib.rs", Path(directory), expand_scope=False)
+            report = probe(project, "lib.rs", Path(directory), scan_level=1)
         self.assertEqual(execute.call_count, 1)
         self.assertEqual(report["status"], "partial")
         self.assertFalse(report["observations"][0]["confirmed"])
@@ -149,7 +272,7 @@ class ClassificationTests(unittest.TestCase):
                 (result, [support], ""), (result, [support, warning], ""),
             ],
         ) as execute:
-            report = probe(project, "lib.rs", Path(directory), expand_scope=False)
+            report = probe(project, "lib.rs", Path(directory), scan_level=1)
         self.assertEqual(execute.call_count, 2)
         self.assertFalse(report["observations"][0]["confirmed"])
 
@@ -167,7 +290,7 @@ class ClassificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "verus_gap.engine.execute", return_value=(result, [warning], ""),
         ) as execute:
-            report = probe(project, "lib.rs", Path(directory), expand_scope=False)
+            report = probe(project, "lib.rs", Path(directory), scan_level=1)
         self.assertEqual(execute.call_count, 1)
         self.assertEqual(report["status"], "partial")
         self.assertEqual(report["stop_reason"], "instrumentation_failure")
@@ -263,7 +386,89 @@ class RealInventoryTests(unittest.TestCase):
         self.assertFalse((project / "target").exists())
         return process, output
 
-    def test_fast_file_retains_cargo_context_without_exploring_dependency_bodies(self):
+    def test_fast_verbose_streams_saved_confirmed_findings_before_the_frontier_ends(self):
+        files = {
+            "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            "src/lib.rs": "mod selected;\nmod helper;\n",
+            "src/selected.rs": (
+                (ROOT / "tests/fixtures/frontier/lib.rs").read_text()
+                + "\npub fn blocked() -> usize { crate::helper::value() }\n"
+            ),
+            "src/helper.rs": "pub fn value() -> usize { let _ = std::time::SystemTime::now(); 1 }\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, output = root / "project", root / "results"
+            for name, text in files.items():
+                path = project / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            with subprocess.Popen(
+                [str(ROOT / "verus-gap"), str(project / "src/selected.rs"), "--out", str(output),
+                 "--fast", "--verbose", "--timeout", "30"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            ) as process:
+                try:
+                    self.assertIsNotNone(process.stdout)
+                    prefix = []
+                    for line in process.stdout:
+                        prefix.append(line)
+                        if "[limitation]" in line:
+                            self.assertIsNone(process.poll())
+                            self.assertFalse((output / "report.json").exists())
+                            checkpoints = list((output / "shards").glob("*/report.json"))
+                            self.assertEqual(len(checkpoints), 1)
+                            checkpoint = json.loads(checkpoints[0].read_text())
+                            accepted = [
+                                record for record in checkpoint["observations"]
+                                if record["confirmed"] and record["category"] == "language_rejection"
+                            ]
+                            self.assertTrue(accepted)
+                            evidence = checkpoints[0].parent / Path(accepted[0]["evidence"]).parent
+                            self.assertTrue((evidence / "verus.txt").is_file())
+                            self.assertTrue((evidence / "confirmation/verus.txt").is_file())
+                            break
+                    else:
+                        self.fail("No live confirmed limitation was emitted")
+                    remaining, _ = process.communicate(timeout=30)
+                    stdout = "".join(prefix) + remaining
+                    self.assertEqual(process.returncode, 1, stdout)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+            report = json.loads((output / "report.json").read_text())
+            shard = json.loads((output / report["shards"][0]["directory"] / "report.json").read_text())
+            self.assertEqual(stdout.count("[limitation]"), 3)
+            self.assertNotIn("SystemTime", stdout)
+            self.assertIn("[probe]", stdout)
+            self.assertIn("[confirm]", stdout)
+            self.assertIn("[isolate]", stdout)
+            self.assertIn("confirmed groups: 1 language / 2 models", stdout)
+            self.assertIn("[scan] level=2", stdout)
+            self.assertEqual(report["scan_level"], 2)
+            self.assertEqual(shard["status"], "partial")
+            self.assertTrue(shard["dependency_boundary_limited"])
+            self.assertEqual(report["coverage"]["expanded_context_files"], 0)
+            for name, text in files.items():
+                self.assertEqual((project / name).read_text(), text)
+            quiet_process, quiet_output = self.scan(
+                files, "--scan-level", "2", target_relative="src/selected.rs",
+            )
+            self.assertEqual(quiet_process.returncode, 1, quiet_process.stdout + quiet_process.stderr)
+            quiet = json.loads((quiet_output / "report.json").read_text())
+            quiet_shard = json.loads((quiet_output / quiet["shards"][0]["directory"] / "report.json").read_text())
+            self.assertNotIn("[probe]", quiet_process.stdout)
+            self.assertNotIn("[limitation]", quiet_process.stdout)
+            self.assertEqual(report["counts"], quiet["counts"])
+            self.assertEqual(report["coverage"], quiet["coverage"])
+            self.assertEqual(shard["events"], quiet_shard["events"])
+            self.assertEqual(
+                [(item["state"], item["confirmation_performed"]) for item in shard["rounds"]],
+                [(item["state"], item["confirmation_performed"]) for item in quiet_shard["rounds"]],
+            )
+
+    def test_level_1_file_retains_cargo_context_without_exploring_dependency_bodies(self):
         files = {
             "Cargo.toml": (
                 '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n'
@@ -277,12 +482,15 @@ class RealInventoryTests(unittest.TestCase):
             "src/helper.rs": "pub fn value() -> usize { let _ = std::time::SystemTime::now(); 1 }\n",
             "src/unrelated.rs": "pub struct Unrelated; unsafe impl Send for Unrelated {}\n",
         }
-        process, output = self.scan(files, "--fast", target_relative="src/selected.rs")
+        process, output = self.scan(files, "--scan-level", "1", target_relative="src/selected.rs")
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         project = json.loads((output / "project.json").read_text())
         self.assertEqual(report["scan_mode"], "fast")
         self.assertEqual(project["scan_mode"], "fast")
+        self.assertEqual(report["scan_level"], 1)
+        self.assertEqual(project["scan_level"], 1)
+        self.assertEqual(report["shards"][0]["scan_level"], 1)
         self.assertTrue(project["baseline_passed"])
         self.assertIn('feature="enabled"', project["rust_cfg"])
         self.assertEqual(report["coverage"]["selected_files"], 1)
@@ -301,19 +509,44 @@ class RealInventoryTests(unittest.TestCase):
         self.assertNotIn("SystemTime", (output / "report.md").read_text())
         self.assertIn("selected source only", (output / "report.md").read_text())
         self.assertFalse(any(event["kind"] == "scope_expansion" for event in report["shards"][0]["events"]))
+        baseline_timestamp = (output / "baseline.stdout").stat().st_mtime_ns
+        resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output), "--verbose"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resumed.returncode, 1, resumed.stdout + resumed.stderr)
+        resumed_report = json.loads((output / "report.json").read_text())
+        self.assertEqual(resumed_report["scan_level"], 1)
+        self.assertEqual(resumed_report["counts"], report["counts"])
+        self.assertIn("[scan] level=1", resumed.stdout)
+        self.assertEqual((output / "baseline.stdout").stat().st_mtime_ns, baseline_timestamp)
 
     def test_fast_resume_inherits_mode_and_retains_existing_evidence(self):
-        process, output = self.scan({"lib.rs": "pub fn good() -> u32 { 1 }\n"}, "--fast")
-        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        process, output = self.scan(
+            {"lib.rs": "pub fn gap() { let _ = std::time::Instant::now(); }\n"}, "--fast",
+        )
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["counts"]["library_specification"], 2)
         evidence = output / report["shards"][0]["directory"] / "round-000/verus.stderr"
         timestamp = evidence.stat().st_mtime_ns
         resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output), "--verbose"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resumed.returncode, 1, resumed.stdout + resumed.stderr)
+        self.assertEqual(json.loads((output / "report.json").read_text())["scan_mode"], "fast")
+        self.assertEqual(json.loads((output / "report.json").read_text())["scan_level"], 2)
+        self.assertEqual(evidence.stat().st_mtime_ns, timestamp)
+        self.assertIn("[reuse]", resumed.stdout)
+        self.assertNotIn("[probe]", resumed.stdout)
+        self.assertNotIn("[limitation]", resumed.stdout)
+        quiet_resume = subprocess.run(
             [str(ROOT / "verus-gap"), "--resume", str(output)],
             capture_output=True, text=True, timeout=30,
         )
-        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertEqual(json.loads((output / "report.json").read_text())["scan_mode"], "fast")
+        self.assertEqual(quiet_resume.returncode, 1, quiet_resume.stdout + quiet_resume.stderr)
+        self.assertNotIn("[reuse]", quiet_resume.stdout)
         self.assertEqual(evidence.stat().st_mtime_ns, timestamp)
 
     def test_fast_directory_checks_all_selected_files_but_no_other_files(self):
@@ -329,6 +562,7 @@ class RealInventoryTests(unittest.TestCase):
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["coverage"]["selected_files"], 3)
+        self.assertEqual(report["scan_level"], 2)
         self.assertEqual(report["coverage"]["expanded_context_files"], 0)
         self.assertEqual(report["counts"]["library_specification"], 3)
         self.assertNotIn("language_rejection", report["counts"])
@@ -338,14 +572,17 @@ class RealInventoryTests(unittest.TestCase):
         process, output = self.scan({"lib.rs": "pub fn good() -> u32 { 1 }\n"})
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         before = {name: (output / name).read_bytes() for name in ("project.json", "report.md", "report.json")}
-        resumed = subprocess.run(
-            [str(ROOT / "verus-gap"), "--resume", str(output), "--fast"],
-            capture_output=True, text=True, timeout=30,
-        )
-        self.assertEqual(resumed.returncode, 2)
-        self.assertIn("keeps its original mode", resumed.stderr)
-        for name, data in before.items():
-            self.assertEqual((output / name).read_bytes(), data)
+        self.assertEqual(json.loads(before["project.json"])["scan_level"], 0)
+        for options in (["--fast"], ["--scan-level", "1"], ["--scan-level", "2"]):
+            with self.subTest(options=options):
+                resumed = subprocess.run(
+                    [str(ROOT / "verus-gap"), "--resume", str(output), *options],
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(resumed.returncode, 2)
+                self.assertIn("keeps its original scan level", resumed.stderr)
+                for name, data in before.items():
+                    self.assertEqual((output / name).read_bytes(), data)
 
     def test_fast_boundary_only_scan_does_not_claim_a_clear_frontier(self):
         files = {
@@ -361,7 +598,32 @@ class RealInventoryTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["partial_files"], 1)
         self.assertEqual(report["coverage"]["frontier_cleared_after_exclusions"], 0)
         self.assertEqual(report["coverage"]["expanded_context_files"], 0)
-        self.assertEqual(report["shards"][0]["stop_reason"], "focused_dependency_boundary")
+        self.assertEqual(report["coverage"]["checking_boundary_only_files"], 1)
+        self.assertEqual(report["coverage"]["excluded_bodies"], 0)
+        self.assertEqual(report["coverage"]["excluded_declarations"], 0)
+        self.assertEqual(report["shards"][0]["stop_reason"], "checking_boundary_only")
+        self.assertEqual(report["scan_level"], 2)
+        directory = output / report["shards"][0]["directory"]
+        initial = json.loads((directory / "report.json").read_text())
+        self.assertEqual(len(initial["rounds"]), 1)
+        evidence = directory / initial["rounds"][0]["evidence"]
+        timestamp = evidence.stat().st_mtime_ns
+        baseline_timestamp = (output / "baseline.stdout").stat().st_mtime_ns
+        resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output), "--verbose"],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
+        self.assertIn("[reuse]", resumed.stdout)
+        self.assertNotIn("[probe]", resumed.stdout)
+        self.assertEqual(evidence.stat().st_mtime_ns, timestamp)
+        self.assertEqual((output / "baseline.stdout").stat().st_mtime_ns, baseline_timestamp)
+        self.assertEqual(json.loads((directory / "report.json").read_text())["rounds"], initial["rounds"])
+        self.assertEqual(json.loads((output / "report.json").read_text())["scan_level"], 2)
+        self.assertIn("Boundary-only early stopping", (output / "report.md").read_text())
+        self.assertIn("deliberately stopped", (output / "review.md").read_text())
+        task = json.loads((output / "agent-tasks.json").read_text())["tasks"][0]
+        self.assertEqual(task["scan_level"], 2)
 
     def test_recognized_standard_models_do_not_become_missing_library_gaps(self):
         source = (
@@ -392,7 +654,7 @@ class RealInventoryTests(unittest.TestCase):
                 "let _ = std::time::Instant::now(); 1"
             )
             files[f"src/chain{index}.rs"] = f"pub fn value() -> usize {{ {body} }}\n"
-        process, output = self.scan(files, target_relative="src/selected.rs")
+        process, output = self.scan(files, "--verbose", target_relative="src/selected.rs")
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["coverage"]["selected_files"], 1)
@@ -406,6 +668,8 @@ class RealInventoryTests(unittest.TestCase):
                 self.assertTrue(group["confirmed"])
                 self.assertTrue(all(place["file"] == f"src/chain{depth - 1}.rs" for place in group["locations"]))
         self.assertNotIn("src/unrelated.rs", report["shards"][0]["scope"])
+        self.assertIn("[scope]", process.stdout)
+        self.assertIn("[model][dependency]", process.stdout)
 
     def test_scoped_directory_keeps_cargo_features_and_transitive_context(self):
         files = {

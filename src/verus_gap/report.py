@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .engine import canonical
-from .project import Project, write_json
+from .project import Project, scan_level_from, write_json
 
 LABELS = {
     "language_rejection": "Rust constructs rejected by Verus",
@@ -61,7 +61,8 @@ def language_family(message: str) -> str:
 def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict:
     groups: dict[tuple, dict] = {}
     selected_set = set(selected)
-    fast = project.manifest.get("scan_mode", "adaptive") == "fast"
+    level = scan_level_from(project.manifest)
+    fast = level > 0
     outside = []
     for shard in shards:
         for record in shard["observations"]:
@@ -128,7 +129,7 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
         "cargo_args": project.manifest["cargo_args"], "complete_inventory": False,
         "checks": project.manifest["checks"],
         "support_mode": project.manifest.get("support_mode"),
-        "scan_mode": project.manifest.get("scan_mode", "adaptive"),
+        "scan_mode": "fast" if fast else "adaptive", "scan_level": level,
         "preparation_check": project.manifest.get("preparation_check"),
         "dependency_setup": project.manifest.get("dependency_setup"),
         "status": "limitations_observed" if confirmed else "no_confirmed_limitations",
@@ -155,6 +156,9 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
             "dependency_boundary_limited_files": sum(
                 shard.get("dependency_boundary_limited", False) for shard in shards
             ),
+            "checking_boundary_only_files": sum(
+                shard["stop_reason"] == "checking_boundary_only" for shard in shards
+            ),
             "outside_scope_diagnostics": len(outside),
         },
         "counts": dict(counts), "groups": grouped,
@@ -169,7 +173,8 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
                 **{key: shard[key] for key in (
                     "focus", "directory", "status", "stop_reason", "scope", "events",
                 )},
-                "scan_mode": shard.get("scan_mode", "adaptive"),
+                "scan_mode": "fast" if fast else "adaptive",
+                "scan_level": scan_level_from(shard),
                 "dependency_boundary_limited": shard.get("dependency_boundary_limited", False),
             }
             for shard in shards
@@ -190,7 +195,8 @@ def markdown(report: dict) -> str:
     coverage = report["coverage"]
     language = report["counts"].get("language_rejection", 0)
     library = report["counts"].get("library_specification", 0)
-    fast = report.get("scan_mode") == "fast"
+    level = scan_level_from(report)
+    fast = level > 0
     lines = [
         "# Verus compatibility inventory", "",
         f"**{language} reproducible language/translation rejections and {library} library specification gaps.** "
@@ -201,8 +207,13 @@ def markdown(report: dict) -> str:
         f"**Unchanged Rust build:** {'passed' if report['baseline_passed'] else 'failed'}. "
         f"**Cargo configuration:** `{' '.join(report['cargo_args']) or 'default features'}`.", "",
         *([
-            "**Mode: fast, selected source only.** The native Cargo context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
-        ] if fast else []),
+            f"**Scan level: {level}{' (fast)' if level == 2 else ''}, selected source only.** The native Cargo context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
+        ] if fast else [
+            "**Scan level: 0.** Uniquely indexed local dependencies may be added to checking; isolation continues while the frontier makes progress.", "",
+        ]),
+        *([
+            "**Boundary-only early stopping:** level 2 stops before further isolation when the current errors are only checking boundaries. Such frontiers remain partial, with their unresolved diagnostics retained. Later gaps in the selected source may still be hidden; early stopping does not weaken the repeated-confirmation requirement for accepted findings.", "",
+        ] if level == 2 else []),
         "These are observed compatibility gaps, not a proof or exhaustive feature inventory. Counts are distinct diagnostic/API groups, not unique Rust features. Each accepted support diagnostic was reproduced twice in the same recorded checking context. File shards retain the full Rust build context, but local/generated items may remain outside Verus checking; those boundaries are not counted as library gaps. Later passes explicitly exclude rejected bodies or declarations. Raw diagnostics, source snapshots, and every patch are retained.",
         "", "## At a glance", "",
         f"Support groups with a primary location in your selected files: "
@@ -226,6 +237,9 @@ def markdown(report: dict) -> str:
             f"| Files limited by deliberately uncrossed checking boundaries | {coverage['dependency_boundary_limited_files']} |",
             f"| Outside-scope/unattributed diagnostics retained only in raw evidence | {coverage['outside_scope_diagnostics']} |",
         ] if fast else []),
+        *([
+            f"| Files stopped early with only checking boundaries remaining | {coverage['checking_boundary_only_files']} |",
+        ] if level == 2 else []),
         f"| Enumerable function declarations (not a count of verified functions) | {coverage['enumerable_functions']} |",
         f"| Explicit body exclusions / declaration exclusions | {coverage['excluded_bodies']} / {coverage['excluded_declarations']} |",
         f"| Macro invocation sites (generated declarations not fully enumerable) | {coverage['macro_sites']} |",
@@ -298,6 +312,10 @@ def save_report(project: Project, shards: list[dict], selected: list[str]) -> di
     (project.output / "report.md").write_text(markdown(report))
     review = ["# Boundaries and blockers", "",
               "These diagnostics are not counted as confirmed Rust or library support gaps.", ""]
+    if report["coverage"]["checking_boundary_only_files"]:
+        review.extend([
+            "Scan level 2 deliberately stopped before further isolation of these checking boundaries. Affected frontiers remain partial; additional selected-source gaps may be hidden. Start a new level-1 scan for continued selected-source exploration.", "",
+        ])
     for group in report["groups"]:
         if group["category"] in {"language_rejection", "library_specification"}:
             continue
@@ -311,7 +329,7 @@ def save_report(project: Project, shards: list[dict], selected: list[str]) -> di
     (project.output / "review.md").write_text("\n".join(review))
     tasks = [
         {
-            "file": shard["focus"], "reason": shard["stop_reason"],
+            "file": shard["focus"], "reason": shard["stop_reason"], "scan_level": shard["scan_level"],
             "evidence": str(Path(shard["directory"]) / "report.json"),
             "objective": "Reproduce and resolve this setup/checking blocker in a separate copy without inventing contracts or suppressing original evidence.",
         }

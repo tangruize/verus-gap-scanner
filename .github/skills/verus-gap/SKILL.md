@@ -5,9 +5,9 @@ description: Identify source-bound Verus language and library-model gaps using r
 
 # Verus gap investigation
 
-Use this skill to answer which Rust constructs or library APIs prevent Verus coverage of a project. It requires no Argus runtime or agent-specific API. Most discovery is performed by the command; use an agent only for a bounded unresolved setup, instrumentation, generated-code, or reduction task.
+Use this skill to identify Rust constructs or library APIs that Verus cannot check in a project's build context. Run the scanner for discovery, then interpret its evidence. Keep manual follow-up bounded to a specific unresolved setup, instrumentation, generated-code, or reduction task.
 
-## Run the human workflow
+## Run a scan
 
 Locate the supplied tool directory or installed executable. Commands are relative to the **tool**, not the directory where this skill was copied. Read its README.
 
@@ -16,15 +16,27 @@ Locate the supplied tool directory or installed executable. Commands are relativ
 ./verus-gap /absolute/path/to/authorized/project
 ```
 
-Setup creates the Python environment and validates the latest official Verus distribution, matching Rust, vstd and Z3. Register an explicitly requested existing distribution with `./setup --verus PATH`, or pin with `--release VERSION`. Do not silently upgrade between experiments.
+Setup creates the Python environment and validates the latest official Verus distribution, matching Rust, vstd and Z3. Register an explicitly requested existing distribution with `./setup --verus PATH`, or pin with `--release VERSION`. Keep the toolchain fixed while investigating or comparing findings.
 
-The default scanner builds an isolated project copy, captures the actual native Cargo context, rechecks syntax-only source preparation with ordinary Rust, smoke-tests compiler support, and probes active files independently. It reproduces candidate support errors before counting them, records explicit body/declaration exclusions, and follows uniquely resolvable local function/type boundaries transitively without a fixed dependency-file cap. SMT verification is off; proof lifetime checking remains on.
+The default scanner builds an isolated project copy, captures the actual native Cargo context, rechecks syntax-only source preparation with ordinary Rust, smoke-tests compiler support, and probes active files independently. It reproduces candidate support errors before counting them, records explicit body/declaration exclusions, and follows uniquely resolvable local function/type boundaries. SMT verification is off; proof lifetime checking remains on.
 
 A crate-defined `full` feature is automatically selected unless the user chooses explicit features or no-default-features. Preserve the project's other build options after `--`. A source file or subdirectory inside a crate retains its containing Cargo context; it is not an isolated dependency-free snippet.
 
 Use `--package NAME` only for ambiguous workspaces, `--bin NAME` for a specific binary, or repeat `--file RELATIVE_PATH_OR_GLOB` to bound the scope. Prefer the user's requested scope; do not expand to unrelated repositories.
 
-When the user wants a quicker selected-source investigation rather than transitive dependency findings, add `--fast`. It retains native Cargo context and controls, but does not recursively expand checking into dependency files. The grouped report includes only observations with primary locations in selected files; unchanged raw context diagnostics remain available. Local checking boundaries are not library gaps. If encountered, they keep the focused frontier partial even after exclusions. Do not claim fast mode has the same recall on every project. Resume inherits the original mode; start a new scan to change it.
+Choose the exploration policy with `--scan-level {0,1,2}`. Explain the levels as exploration depth, not finding confidence or fixed runtime:
+
+| Level | User-facing meaning | Scanner policy |
+|---|---|---|
+| `0` (default) | Investigate selected source and needed local dependencies | Follow uniquely resolvable local dependencies and continue isolation |
+| `1` | Keep looking for more gaps in the selected code | No dependency checking expansion; continue local body/declaration isolation |
+| `2` / `--fast` | Get quick initial findings from the selected code | No dependency checking expansion; stop before further isolation when only checking-boundary errors remain |
+
+All levels retain native Cargo context, preparation controls and repeated confirmation of new support observations. Levels 1 and 2 require grouped primary locations in selected files; unchanged raw context diagnostics remain available. Do not promise identical findings across levels.
+
+A checking boundary means a referenced type, function, or trait is currently outside Verus checking or has been explicitly excluded. It can occur inside the selected file, not just in dependencies, and is not automatically a language or library-model gap. If encountered, it keeps the focused frontier partial even after exclusions. Level 2 stops only when all remaining error diagnostics, excluding compiler summaries, are checking boundaries and no setup/instrumentation blocker is present. Its `checking_boundary_only` stop deliberately leaves those errors unresolved and can hide additional selected-source gaps. Report this limit explicitly rather than calling the scan complete. Resume inherits the recorded level and reuses a deliberately finished boundary-only frontier without another probe; start a new scan to change levels. Conflicting `--fast` and numeric-level options are rejected.
+
+Use `--verbose` with any level when live progress is useful. It flushes round/confirmation/action updates and newly confirmed groups with original errors and locations. Repeated groups are deduplicated, level-1/2 findings stay in selected source, and unconfirmed/setup/compiler diagnostics are not labeled limitations. Verbosity adds no compiler calls and may be changed on resume; still read the final reports and raw evidence.
 
 Build scripts and macros execute in the copy. Use trusted input and preserve the original project.
 
@@ -43,7 +55,7 @@ Read `report.md`, `report.json`, `review.md`, and `project.json`, even on a nonz
 | `compiler_failure` | An ICE/panic, not a verdict that a whole Rust feature is unsupported |
 | `dependency_codegen_blocker` | Dependency artifact/MIR setup issue, not a source migration requirement |
 
-Counts are canonical diagnostic/API groups, not unique language features, total unsupported operations, or proved functions. Report selected files, dependency scope, enumerable declarations, pending/partial frontiers, exclusions, source restoration, compiler version, and cfg/features/target.
+Counts are canonical diagnostic/API groups, not unique language features, total unsupported operations, or proved functions. Report scan level, selected files, dependency scope, enumerable declarations, pending/partial frontiers, exclusions, source restoration, compiler version, and cfg/features/target.
 
 The raw diagnostic text must remain unchanged. Adjacent original locations are source-mapped; rendered compiler excerpts retain the compiler's generated line numbers.
 
@@ -67,7 +79,7 @@ Resume with `./verus-gap --resume RESULT_DIR` after a tool/setup fix. Resume val
 
 Keep the same compiler, edition, cfg/features, target, relevant generic types, and smallest real dependency closure. Run unchanged Rust first, then reproduce the same rejected construct/API and canonical Verus diagnostic. A different error in the same broad category is not a successful reduction.
 
-For compiler panics, preserve the exact trace and context; never generalize a macro-local-constant panic to all constants. Check generated code and source attribution. For library gaps, distinguish absent recognized models from ignored local items and unsupported trait instances. Do not invent contracts or insert assumed specifications just to clear the scan.
+For compiler panics, preserve the exact trace and context; a compiler failure is not evidence that a Rust feature is unsupported. Check generated code and source attribution. For library gaps, distinguish absent recognized models from ignored local items and unsupported trait instances. Do not invent contracts or insert assumed specifications just to clear the scan.
 
 Keep a reduction's provenance, source, commands, raw diagnostics, and controls separate from original evidence. Do not patch the user's production sources or add trust without explicit authorization.
 

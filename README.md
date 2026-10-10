@@ -23,28 +23,43 @@ Already have a complete Verus distribution? Use `./setup --verus /absolute/path/
 
 The demo intentionally reports missing `std::time::Instant` models and exits with code 1. The real command automatically discovers Cargo, builds the unchanged crate with Verus's matching Rust, and scans its active files. A crate-defined `full` feature is selected automatically; otherwise Cargo's default features are retained.
 
-A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**. The scanner retains the real root, target, features, generated files, and Cargo dependency artifacts; it does not compile the chosen file as a dependency-free snippet. During checking it follows uniquely indexed local function/type boundaries transitively, rather than stopping after a fixed number of dependency files. Selected-source findings and added dependency findings are labeled separately. Ambiguous/generated boundaries and exhausted time budgets remain explicit limits. A standalone `.rs` file works too. Workspaces with ambiguous members list their names; use `--package NAME`. For different features, use `--features FEATURE`, or pass normal Cargo options after `--`.
+A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**. The scanner keeps the real target, features, generated files, and Cargo build context; it does not treat the chosen file as a dependency-free snippet. By default, it also investigates resolvable local dependencies that block checking, labeling their findings separately from selected-source findings. A standalone `.rs` file works too. For an ambiguous workspace, use `--package NAME`; for different features, use `--features FEATURE`, or pass normal Cargo options after `--`.
 
 ```bash
-./verus-gap /path/to/tokio/tokio --file 'src/sync/*.rs'
+./verus-gap /path/to/crate --file 'src/write/*.rs'
 ./verus-gap /path/to/workspace --package my_crate -- --no-default-features
 ./verus-gap --resume /path/to/verus-gap-results/RESULT
 ```
 
-For a quicker investigation focused on the selected source, add **`--fast`**:
+Choose the exploration policy with **`--scan-level {0,1,2}`**. The default is **0**; **`--fast` is an alias for level 2**.
+
+| Level | What it does | When to choose it |
+|---|---|---|
+| `0` | Investigate selected source and local dependencies needed to continue checking | You also want dependency findings |
+| `1` | Stay in selected source, trying to work around checking obstacles to find more gaps | You want a deeper look at the selected code |
+| `2` / `--fast` | Stay in selected source, stopping when only checking obstacles remain | You want quick initial findings |
 
 ```bash
-./verus-gap /path/to/tokio/tokio/src/sync/mutex.rs --fast
-./verus-gap /path/to/tokio/tokio --file 'src/sync/*.rs' --fast
+./verus-gap /path/to/crate/src/write/encoder.rs --scan-level 1
+./verus-gap /path/to/crate/src/write/encoder.rs --fast --verbose
 ```
 
-Fast mode keeps the same native Cargo context, source-preparation controls and repeated support evidence. It does not recursively add dependency files to Verus checking, and grouped findings require a primary location in your selected files. Local dependencies remain explicit checking boundaries; affected target bodies/declarations can be isolated to expose other target findings, but those exclusions can hide additional gaps. A frontier that encountered an uncrossed dependency boundary stays partial even if its final compiler errors were excluded. Full raw output is retained, including context diagnostics not presented as selected-source findings. Use the default mode when you also want transitive dependency investigation; fast mode is not a promise of identical recall on every project.
+All levels use the same build checks and confirm each new support finding with a second run of the same code copy. Levels 1 and 2 check and report only the selected source, without expanding checking into dependency files. The difference is how long they keep looking, not how strongly they confirm a finding. Levels are not fixed runtime guarantees, and none guarantees that every gap will be found.
 
-Resume validates source/compiler/dependency identities, reuses the baseline and completed shards, and continues partial frontiers. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour). No per-function agent calls are needed.
+A **checking boundary** means Verus cannot currently use a referenced type, function, or trait because it is outside checking or has been explicitly excluded. This can happen inside your selected file as well as at a dependency. It is a checking obstacle, not automatically a Verus language or library-model gap. Level 1 keeps trying to work around these obstacles; level 2 stops when they are the only errors left, with no setup or instrumentation blocker. The report stays **partial** and retains those errors in `review.md`; more gaps may be hidden behind them. Conflicting options such as `--fast --scan-level 1` are rejected.
 
-Resume also keeps the original scan mode; an existing default scan cannot be turned into a fast scan. Start a new output directory to change modes.
+Add **`--verbose`** to see live probe/confirmation phases, round timings, scope expansion or exclusion actions, cumulative group counts, and newly confirmed limitations with original error messages and source locations:
 
-The scanner caches unchanged source overlays, diffs and source-location indexes, and indexes local dependency names once per frontier. These optimizations do not change the checking scope or isolation order. An already accepted observation keeps its original two-run evidence; seeing it again does not trigger another confirmation unless the round contains a new or still-unconfirmed support observation. New observations and compiler failures still require same-overlay confirmation, and all raw runs and patches are retained.
+```bash
+./verus-gap /path/to/crate/src/write/encoder.rs --fast --verbose
+./verus-gap --resume /path/to/verus-gap-results/RESULT --verbose
+```
+
+Output is flushed as progress becomes available, including through a file or pipe. A limitation is announced only after its confirmation and evidence have been saved. Repeated groups are not announced again; selected-source and dependency findings are labeled separately. Setup errors, checking boundaries and compiler failures are not announced as limitations. The final reports and raw evidence are still saved normally. Verbosity changes display only and can be enabled or disabled on resume.
+
+Resume validates the input, compiler and dependency identities, reuses completed work, and continues unfinished scans. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour).
+
+Resume inherits the recorded scan level when none is specified and rejects an explicitly different level. Level-2 boundary-only stops are deliberately finished under that policy, although coverage remains partial; resume reuses their evidence without another probe. Start a new output directory to change levels or investigate those boundaries further.
 
 Use trusted projects: Cargo build scripts and procedural macros execute in the copied workspace.
 
@@ -64,16 +79,14 @@ Open the printed **`report.md`**. Its summary groups language rejections by erro
 
 ## What the scanner does—and does not establish
 
-It first validates the unchanged Rust build, then rechecks syntax-only cfg/lifetime preparation with ordinary Rust. It smoke-tests Verus support before interpreting application errors. Each counted support diagnostic must map into the actually checked source and reproduce in a second run with the same overlay. Unsupported bodies/declarations are then explicitly excluded to expose later errors; all exclusions are recorded. Existing top-level `#[verus_verify]` / `#[verus_spec]` items keep their original attribute-based checking instead of being wrapped twice. An otherwise ordinary `impl` containing attribute-verified methods uses one outer attribute-based pass, also checking its ordinary sibling methods. A mixed-rewriting warning is an instrumentation failure: neither the initial nor confirmation run may contain one for a support diagnostic to be accepted. Rust derives remain present; derived-model warnings are reported separately.
+The scanner checks that the unchanged Rust project builds, checks its source preparation with ordinary Rust, and smoke-tests Verus support before interpreting application errors. Each counted finding must map to the original checked source and reproduce in a second run of the same prepared code. It temporarily excludes blocked code in the scan copy to reveal later errors, recording every exclusion. Existing Verus annotations and Rust derives are preserved; setup and preparation failures are reported separately, not counted as application support gaps.
 
-For an existing Verus-aware crate or local dependency, it uses official Cargo-Verus to build real ghost metadata and VIR. Registered Verus support versions are aligned **only in the scan copy**, with a manifest diff and a second native control build. Root probes emit metadata, not native executables. For custom targets, matching builtin/vstd support is built from the exact Verus release source; the target is never silently replaced by the host, and proof lifetime checks are never automatically disabled. Nanvix's recognized kernel target/build-std configuration is selected automatically and recorded.
+Existing Verus-aware dependencies use official Cargo-Verus. Any support-version alignment happens **only in the scan copy**, with a recorded manifest diff and another Rust build check. Custom targets retain their actual target and build options; the tool does not silently switch to the host or disable proof lifetime checks. SMT proof verification is off during scanning.
 
 **This is a compatibility investigation, not a proof or exhaustive inventory.** File shards retain the Rust dependency context, but unwrapped/generated items can remain checking boundaries. Scope expansion is conservative source indexing, not a semantic call graph. Early signature/trait/macro/compiler failures and excluded bodies can hide more gaps. Clearing a frontier after exclusions does not mean the original program is supported or verified. A library finding means its model was not recognized in the recorded configuration—not that no model exists anywhere or that the API is inherently unverifiable.
 
 External path dependencies, generated assets, and unusual platform setup may require a self-contained prepared copy. The tool refuses to copy your home/filesystem root or follow symlinks outside the workspace. Failed setup is reported, never relabeled as an application gap.
 
-The optional [agent skill](.github/skills/verus-gap/SKILL.md) works with Copilot or any agent that can run commands and read files. The command itself does not require an agent.
+Use the optional [agent skill](.github/skills/verus-gap/SKILL.md) to guide an agent through scanning and interpreting the evidence, or run the command directly in your terminal.
 
-For Python package installation, `pip install .` also provides `verus-gap` and `verus-gap-setup`; its toolchain cache is `$XDG_CACHE_HOME/verus-gap` (or `~/.cache/verus-gap`, override with `VERUS_GAP_HOME`). The checkout's two commands use its local `.tools` directory. `--frontier` retains the old one-pass scanner for diagnostic comparison, not normal inventory use.
-
-See [validation and interpretation](VALIDATION.md) for the tested compiler/platform, the frozen 114-test release and current 128-test checkout, real setup/model/instrumentation controls, selected-range experiments, and remaining scientific limits. The previously published source/wheel archives remain unchanged and do not contain fast mode. Per-project evidence is delivered separately in the `verus-gap-reports` bundle.
+For Python package installation, `pip install .` also provides `verus-gap` and `verus-gap-setup`; its toolchain cache is `$XDG_CACHE_HOME/verus-gap` (or `~/.cache/verus-gap`, override with `VERUS_GAP_HOME`). The checkout's two commands use its local `.tools` directory.

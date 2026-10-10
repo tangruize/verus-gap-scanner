@@ -25,6 +25,19 @@ def write_json(path: Path, payload: dict):
     temporary.replace(path)
 
 
+def scan_level_from(record: dict) -> int:
+    if "scan_level" in record:
+        level = record["scan_level"]
+    else:
+        mode = record.get("scan_mode", "adaptive")
+        if mode not in ("adaptive", "fast"):
+            raise GapError(f"Unknown saved scan mode: {mode!r}.")
+        level = 0 if mode == "adaptive" else 1
+    if type(level) is not int or level not in (0, 1, 2):
+        raise GapError(f"Invalid scan level: {level!r}; expected 0, 1, or 2.")
+    return level
+
+
 @dataclass
 class Project:
     output: Path
@@ -145,6 +158,7 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         "target": target["name"] if target else root.stem,
         "manifest_relative": str(manifest_path.relative_to(source_root)) if manifest_path else None,
         "ghost_dependencies_required": ghost_dependencies,
+        "scan_level": getattr(args, "scan_level", 0),
         "cargo_args": cargo_args, "source_sha256": hashes,
         "verus": version, "verus_executable": str(verus),
         "tool_sha256": {

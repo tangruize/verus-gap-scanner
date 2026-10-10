@@ -15,6 +15,7 @@ class ReportTests(unittest.TestCase):
         project = SimpleNamespace(sources={"selected.rs": source, "dependency.rs": source}, manifest={
             "input": "fixture", "package": "fixture", "verus": {"version": "fixture"}, "baseline_passed": True,
             "cargo_args": [], "checks": {"proof_lifetimes": True}, "workspace_restored": True, "scan_mode": "fast",
+            "scan_level": 1,
         })
         selected = {"file": "selected.rs", "byte": 0, "line": 1, "column": 1, "source": "target()"}
         dependency = dict(selected, file="dependency.rs")
@@ -29,10 +30,12 @@ class ReportTests(unittest.TestCase):
             "observations": [record, dict(record, message="dependency-only", locations=[dependency])],
             "events": [], "focus": "selected.rs", "directory": "shards/a", "scope": ["selected.rs"],
             "status": "partial", "stop_reason": "focused_dependency_boundary",
-            "dependency_boundary_limited": True,
+            "dependency_boundary_limited": True, "scan_level": 1,
         }
         report = aggregate(project, [shard], ["selected.rs"])
         self.assertEqual(report["scan_mode"], "fast")
+        self.assertEqual(report["scan_level"], 1)
+        self.assertEqual(report["shards"][0]["scan_level"], 1)
         self.assertEqual(report["counts"], {"library_specification": 1})
         self.assertEqual(report["selected_scope_counts"], report["counts"])
         self.assertEqual(report["coverage"]["expanded_context_files"], 0)
@@ -45,8 +48,21 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(record["locations"], [selected, dependency])
         self.assertEqual(report["outside_scope_evidence"][0]["evidence"], "shards/a/round-000/verus.txt")
         text = markdown(report)
-        self.assertIn("Mode: fast, selected source only", text)
+        self.assertIn("Scan level: 1, selected source only", text)
         self.assertNotIn("#### dependency-only", text)
+        self.assertNotIn("`dependency.rs:", text)
+        project.manifest["scan_level"] = shard["scan_level"] = 2
+        shard["stop_reason"] = "checking_boundary_only"
+        early = aggregate(project, [shard], ["selected.rs"])
+        self.assertEqual(early["scan_level"], 2)
+        self.assertEqual(early["shards"][0]["scan_level"], 2)
+        self.assertEqual(early["coverage"]["checking_boundary_only_files"], 1)
+        self.assertEqual(early["coverage"]["partial_files"], 1)
+        self.assertEqual(early["groups"], report["groups"])
+        text = markdown(early)
+        self.assertIn("Scan level: 2 (fast), selected source only", text)
+        self.assertIn("Boundary-only early stopping", text)
+        self.assertIn("Later gaps in the selected source may still be hidden", text)
         self.assertNotIn("`dependency.rs:", text)
 
     def test_public_api_ignores_bracketed_const_bounds(self):
@@ -102,6 +118,7 @@ class ReportTests(unittest.TestCase):
             "status": "partial", "stop_reason": "unresolved_frontier",
         }
         report = aggregate(project, [shard], ["selected.rs"])
+        self.assertEqual(report["scan_level"], 0)
         self.assertEqual(report["counts"]["library_specification"], 2)
         self.assertEqual(report["selected_scope_counts"]["library_specification"], 1)
         self.assertEqual(report["coverage"]["expanded_context_files"], 1)

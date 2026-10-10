@@ -6,11 +6,12 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .gap import GapError, run, save_run
-from .project import Project, write_json
+from .project import Project, scan_level_from, write_json
 from .source import Declaration, Rendered
 
 
@@ -436,14 +437,21 @@ def dependencies(project: Project, state: State, records: list[dict],
 
 
 def probe(project: Project, focus: str, output: Path, max_rounds: int | None = None,
-          per_run: float = 60, expand_scope: bool = True) -> dict:
+          per_run: float = 60, scan_level: int = 0,
+          progress: Callable[[str, dict], None] | None = None) -> dict:
+    def notify(phase: str, **details):
+        if progress is not None:
+            progress(phase, {"focus": focus, **details})
+
+    level = scan_level_from({"scan_level": scan_level})
+    expand_scope = level == 0
     state = State([focus])
     mode = "adaptive" if expand_scope else "fast"
     summary = {
         "schema": "verus-gap/shard-v2", "focus": focus, "scope": [focus],
         "status": "partial", "stop_reason": "", "rounds": [], "observations": [],
         "events": [], "complete_inventory": False, "workspace_restored": False,
-        "scan_mode": mode, "dependency_boundary_limited": False,
+        "scan_mode": mode, "scan_level": level, "dependency_boundary_limited": False,
     }
     revision = hashlib.sha256(json.dumps(project.manifest["tool_sha256"], sort_keys=True).encode()).hexdigest()[:12]
     checkpoint = output / "report.json"
@@ -451,7 +459,7 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
         previous = json.loads(checkpoint.read_text())
         if (
             previous.get("scanner_revision") == revision and previous["focus"] == focus
-            and previous.get("scan_mode", "adaptive") == mode
+            and scan_level_from(previous) == level
         ):
             summary = previous
             state.scope = list(previous["scope"])
@@ -464,6 +472,7 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 if field_name:
                     getattr(state, field_name).setdefault(event["file"], set()).add(event["id"])
     summary["scanner_revision"] = revision
+    summary["scan_level"] = level
     seen = {record_key(record) for record in summary["observations"]}
     accepted = {
         record_key(record) for record in summary["observations"]
@@ -475,6 +484,7 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
     budget = max_rounds if max_rounds is not None else 4 + 3 * sum(
         len(source.declarations) for source in project.sources.values()
     )
+    notify("restore", observations=list(summary["observations"]))
     try:
         for number in range(start, start + budget):
             if time.monotonic() >= project.deadline:
@@ -486,6 +496,7 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 break
             states.add(fingerprint)
             directory = output / f"round-{number:03d}"
+            notify("probe", round=number, scope=list(state.scope))
             result, records, _ = execute(project, state, directory, per_run)
             panic = compiler_panic(result, project, state)
             has_panic = panic is not None
@@ -504,9 +515,13 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 and not any(item["category"] == "instrumentation_failure" for item in records)
             ]
             confirmed = set()
+            confirmation_seconds = 0.0
             new_candidates = [record for record in candidates if record_key(record) not in accepted]
             if new_candidates or panic:
+                notify("confirmation", round=number, candidates=len(new_candidates),
+                       compiler_failure=has_panic)
                 second, repeated, _ = execute(project, state, directory / "confirmation", per_run)
+                confirmation_seconds = second["seconds"]
                 repeated_panic = compiler_panic(second, project, state)
                 if panic and repeated_panic and not second["timed_out"]:
                     confirmed.add(record_key(repeated_panic))
@@ -514,21 +529,24 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                     record["category"] == "instrumentation_failure" for record in repeated
                 ):
                     confirmed = {record_key(record) for record in repeated}
+            new_observations = []
             for record in records:
                 if record["category"] == "compiler_summary":
                     continue
                 key = record_key(record)
                 if key not in seen:
                     seen.add(key)
-                    summary["observations"].append(dict(
+                    observation = dict(
                         record, round=number, evidence=f"round-{number:03d}/verus.txt",
                         scope=list(state.scope), confirmed=key in confirmed,
                         source_variant="prepared" if not state.events else "isolated",
-                    ))
+                    )
+                    summary["observations"].append(observation)
                     if key in confirmed and record["category"] in {
                         "language_rejection", "library_specification",
                     }:
                         accepted.add(key)
+                        new_observations.append(observation)
             blockers = sorted({
                 record["category"] for record in records
                 if (record["level"] == "error" or record["category"] == "instrumentation_failure")
@@ -547,11 +565,16 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
             summary["events"] = list(state.events)
             summary["scope"] = list(state.scope)
             write_json(output / "report.json", summary)
+            notify("round", round=number, observations=new_observations,
+                   seconds=result["seconds"], confirmation_seconds=confirmation_seconds,
+                   confirmation_performed=bool(new_candidates or panic), blockers=blockers)
             if result["timed_out"]:
                 summary["stop_reason"] = "per_run_timeout"
                 break
+            event_offset = len(state.events)
             if panic:
                 if refine(project, state, [panic], number + 1):
+                    notify("action", round=number + 1, events=state.events[event_offset:])
                     continue
                 summary["stop_reason"] = "compiler_failure"
                 break
@@ -565,6 +588,15 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                 exclusions = any(event["kind"] != "scope_expansion" for event in state.events)
                 summary["status"] = "frontier_cleared_after_exclusions" if exclusions else "frontend_clear"
                 summary["stop_reason"] = "no_remaining_errors"
+                break
+            errors = [
+                record for record in records
+                if record["level"] == "error" and record["category"] != "compiler_summary"
+            ]
+            if level == 2 and not blockers and errors and all(
+                record["category"] == "checking_boundary" for record in errors
+            ):
+                summary["stop_reason"] = "checking_boundary_only"
                 break
             if expand_scope and dependency_index is None and any(
                 record["category"] == "checking_boundary" for record in records
@@ -584,10 +616,12 @@ def probe(project: Project, focus: str, output: Path, max_rounds: int | None = N
                     "round": number + 1, "file": next_file, "kind": "scope_expansion",
                     "trigger": "resolve a uniquely indexed local checking boundary",
                 })
+                notify("action", round=number + 1, events=state.events[event_offset:])
                 continue
             if not refine(project, state, records, number + 1):
                 summary["stop_reason"] = "unresolved_frontier"
                 break
+            notify("action", round=number + 1, events=state.events[event_offset:])
         else:
             summary["stop_reason"] = "round_limit"
     except (GapError, OSError, UnicodeError) as error:

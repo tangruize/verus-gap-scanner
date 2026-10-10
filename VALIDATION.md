@@ -18,11 +18,30 @@ The conservative revision (`4040d79a6756`, commit `7dfba68`) passes **122 tests*
 
 ## Focused fast mode
 
-The current checkout (`112fdd0b3755`) passes **128 tests**. Fast-mode regressions cover actual Cargo file/directory scopes, retained features, no recursive dependency-body checking, selected-only primary and related locations, unchanged raw diagnostics, explicitly partial dependency-limited frontiers, inherited mode on resume, and refusal to convert an existing default scan into fast mode.
+The fast-mode revision (`112fdd0b3755`) passes **128 tests**. Fast-mode regressions cover actual Cargo file/directory scopes, retained features, no recursive dependency-body checking, selected-only primary and related locations, unchanged raw diagnostics, explicitly partial dependency-limited frontiers, inherited mode on resume, and refusal to convert an existing default scan into fast mode.
 
 Fast mode is a deliberate scope tradeoff, not a semantics-preserving optimization of the default exploration policy. It retains the native build and source-preparation controls, but does not cross local checking boundaries into unselected files. An encountered boundary keeps the frontier partial even if later exclusions remove the final compiler errors. File shards remain independent even when several files or a directory are selected.
 
 The published 114-test source/wheel archives remain unchanged. These conservative and fast-mode revisions are available in the checkout; the old archives do not contain them.
+
+## Scan levels
+
+`--scan-level 0` is the default dependency-expanding policy. Level 1 retains selected-source-only continued isolation. Level 2, also available as `--fast`, ends a frontier before further isolation when its current error diagnostics are only checking boundaries, excluding compiler summaries. Setup/instrumentation blockers, other errors, timeouts and compiler failures do not satisfy this early-stop condition. New support observations keep the same repeated-confirmation requirement at every level.
+
+The project, shard, grouped report and follow-up tasks record the numeric level. Resume inherits it, rejects a conflicting explicit level, and reuses deliberately finished `checking_boundary_only` frontiers without new compiler calls. Those frontiers retain unresolved raw evidence and remain partial; a higher level can miss support gaps hidden behind the checking boundary. Levels describe exploration depth, not a fixed number of seconds.
+
+The final targeted 47-test run passes CLI, classification, confirmation, early-stop, reporting, real streamed alias/numeric-level equivalence, and real level-1 resume controls. Additional real Cargo/Verus controls exercise default dependency expansion, selected directories, boundary-only partial reports, preserved native features and cached evidence. Python 3.11 grammar checks pass for all seven changed Python files.
+
+Sequential pinned Tokio mutex runs use the same source, dependency lock, Cargo targets/profiles/features, and compiler/support identities as the earlier comparison:
+
+| Policy | Whole-command seconds | Scan-phase seconds | Compiler seconds | Exploration / confirmation calls | Language / model groups |
+|---|---:|---:|---:|---:|---:|
+| Level 1, continued selected-source isolation | 84.353 | 70.5 | 69.149 | 34 / 4 | 5 / 10 |
+| Level 2 (`--fast`), boundary-only early stop | 29.368 | 16.0 | 15.835 | 5 / 4 | 5 / 10 |
+
+Level 1 exactly retains the prior focused policy's 34 state fingerprints, exclusions, diagnostic counts, 39 accepted observation keys, and primary/related source positions. Level 2 retains all those accepted observations, 39 primary and 11 related positions, and the identical first five state fingerprints. It stops at round 004, the first boundary-only round, with 32 body and 13 declaration exclusions instead of 36 and 65. Its recorded checking-boundary groups decrease from 18 to 12 because later boundary cleanup is deliberately not performed, not because those items became supported. Both frontiers remain partial.
+
+Independent repeated-evidence and identity/restoration audits pass both runs. A production level-2 resume inherits level 2, adds no probes or confirmations, and preserves the hashes and modification times of all 29 audited baseline/round/confirmation evidence files. These shared-host timings are measured observations, not fixed level durations; this mutex result does not establish equal recall on other inputs.
 
 ## Measured Tokio mutex comparison
 
@@ -39,6 +58,14 @@ The conservative comparison retains all 197 support groups, 402 accepted observa
 Fast retains all 15 mutex-local support groups and all 38 original primary locations. It adds one reproduced `UnsafeCell` occurrence on the `Mutex` declaration, not another model group. Eight secondary spans from the broader baseline are not repeated in that role, but all eight coordinates remain primary locations of the same confirmed groups. No original selected-source coordinate is lost, and all grouped primary/related locations stay in the selected file. The 39 accepted fast observations independently pass the same controls and repeated-evidence audit. Its one frontier remains deliberately dependency-limited and partial; this result is not a general equal-recall guarantee.
 
 Wall measurements include native setup/controls and scanning but exclude earlier tool installation. The original wall figure is reconstructed from its result-directory timestamp and final unchanged report timestamp; new figures use a monotonic subprocess timer. The final conservative and fast reruns were sequential in independent build/output directories, without overlapping this task's test suite. This is a shared host, not a controlled dedicated-host benchmark: observed wall reductions of about 31% and 88% are measurements, not universal speedup promises. Preliminary unpinned runs resolved newer `syn`/`smallvec` versions; their evidence is retained but their timings are not used in this same-dependency table.
+
+## Live verbose output
+
+`--verbose` observes existing probe, confirmation, checkpoint and isolation/expansion events. It changes terminal output only; it does not add compiler calls, change source overlays, persist a new scan mode, or replace the final reports. New limitation notices require a stored confirmed support observation, and group identities reuse canonical messages and public API names. Default output labels dependency context separately; fast output keeps primary locations in selected source. Cached/resumed observations seed counts without being announced again.
+
+Related CLI, engine/report and actual Cargo/Verus regressions pass. A pipe-based real fixture receives a flushed limitation before its frontier finishes and verifies that both initial/confirmation evidence and the accepted checkpoint already exist. Quiet and verbose runs retain identical counts, exclusions, scope events and round/confirmation states. Additional controls cover non-support/unconfirmed filtering, exact raw messages, public-API grouping, immutable records, cached resume with verbosity enabled then disabled, and ordinary dependency expansion in verbose mode.
+
+The actual pinned Tokio mutex `--fast --verbose` run retains all 15 support groups, 39 accepted observations, 39 primary and 11 related positions, all 34 round-state fingerprints, the same exclusions and deliberately partial frontier, and the same 38 compiler calls (34 probes and four confirmations). Every live group matches its unchanged accepted diagnostic and selected-source primary location; no group is announced twice. Its first limitation appears 3.5 seconds after scanning starts, all 15 groups are visible by 10.5 seconds, and the final round finishes at 70.2 seconds. Those progress timestamps exclude native setup; the full command took 83.715 seconds on the shared host. Independent result-equivalence and repeated-evidence audits pass. This is a live-output check, not another general speedup claim.
 
 ## Controls against misleading findings
 
