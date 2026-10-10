@@ -1,6 +1,6 @@
 # Verus Gap
 
-Find Rust constructs and library APIs that **the installed Verus cannot check in your project's real build context**. The scanner builds a copy, probes active files independently, isolates observed blockers, and writes a grouped report. By default, it looks for quick initial findings in the selected code; deeper exploration is available with `--scan-level`. It never edits the input project or invents specifications.
+Find Rust constructs and library APIs that **the installed Verus cannot check in your project's real build context**. The scanner builds a copy, investigates active files, confirms observed gaps, and writes a grouped report with original source locations and compiler evidence. It never edits the input project or invents specifications.
 
 ## Install once
 
@@ -16,102 +16,103 @@ Already have a complete Verus distribution? Use `./setup --verus /absolute/path/
 
 ## Scan
 
+Try Tokio after setup. Run these commands from the tool directory, choosing an unused clone destination:
+
 ```bash
+git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap"
+./verus-gap "$HOME/tokio-verus-gap/tokio" --jobs 32 --verbose
+```
+
+This selects the Tokio library crate inside the cloned workspace, enables its `full` feature, and scans with live progress and up to 32 concurrent file workers. **Scan level 2 is the default and the recommended first pass**; no level option is needed. The clone follows Tokio's default branch, so its findings can differ from the measured examples below.
+
+For your own project or a small built-in example:
+
+```bash
+./verus-gap /absolute/path/to/your/crate --jobs 32 --verbose
 ./verus-gap demo
-./verus-gap /absolute/path/to/your/crate
 ```
 
-The demo intentionally reports missing `std::time::Instant` models and exits with code 1. The real command automatically discovers Cargo, builds the unchanged crate with Verus's matching Rust, and scans its active files. A crate-defined `full` feature is selected automatically; otherwise Cargo's default features are retained.
+The demo intentionally reports missing `std::time::Instant` models and exits 1. For a real crate, the scanner discovers Cargo, builds the unchanged code with Verus's matching Rust, and scans active source. A crate-defined `full` feature is selected automatically unless you choose features explicitly; otherwise Cargo's default features are retained.
 
-A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**. The scanner keeps the real target, features, generated files, and Cargo build context; it does not treat the chosen file as a dependency-free snippet. Default scans keep Verus checking and reported findings within your selected source. Use `--scan-level 0` to also investigate resolvable local dependencies that block checking, labeling their findings separately. A standalone `.rs` file works too. For an ambiguous workspace, use `--package NAME`; for different features, use `--features FEATURE`, or pass normal Cargo options after `--`.
+A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**, target, generated files, or build options. It is not treated as a dependency-free snippet. A standalone `.rs` file works too. Use `--package NAME` for an ambiguous workspace, `--bin NAME` for a specific binary, and repeat `--file RELATIVE_PATH_OR_GLOB` to select files. Choose features with `--features FEATURE`, or pass normal Cargo options after `--`.
 
 ```bash
-./verus-gap /path/to/crate --file 'src/write/*.rs'
+./verus-gap /path/to/crate --file 'src/write/*.rs' --jobs 32 --verbose
 ./verus-gap /path/to/workspace --package my_crate -- --no-default-features
-./verus-gap --resume /path/to/verus-gap-results/RESULT
 ```
 
-Choose the exploration policy with **`--scan-level {0,1,2}`**. New scans default to **2**, so no level option is needed for quick initial findings.
+## Choose a scan level
+
+**Keep the default level 2 for a normal gap inventory.** Levels 1 and 0 are not recommended for routine first-pass scans: they spend more time exploring checking obstacles and can add relatively few findings. Use them when you specifically need deeper selected-source investigation or dependency findings.
 
 | Level | What it does | When to choose it |
 |---|---|---|
-| `0` | Investigate selected source and local dependencies needed to continue checking | You also want dependency findings |
-| `1` | Stay in selected source, trying to work around checking obstacles to find more gaps | You want a deeper look at the selected code |
-| `2` (default) | Stay in selected source, stopping when only checking obstacles remain | You want quick initial findings |
+| `2` (default) | Investigate selected source; stop when only checking boundaries remain | Recommended first pass |
+| `1` | Stay in selected source and continue working around checking boundaries | Investigate gaps that may be hidden behind a boundary |
+| `0` | Also investigate resolvable local dependencies needed to continue checking | Include dependency findings, labeled separately |
 
-```bash
-./verus-gap /path/to/crate/src/write/encoder.rs --verbose
-./verus-gap /path/to/crate/src/write/encoder.rs --scan-level 1
-./verus-gap /path/to/crate/src/write/encoder.rs --scan-level 0
-```
+Recorded serial comparisons show the time/retention tradeoff:
 
-All levels use the same build checks and confirm each new support finding with a second run of the same code copy. Levels 1 and 2 check and report only the selected source, without expanding checking into dependency files. The difference is how long they keep looking, not how strongly they confirm a finding. Levels are not fixed runtime guarantees, and none guarantees that every gap will be found.
+| Selected input and reference | Level-2 time saved | Confirmed groups retained | Primary group/location records retained |
+|---|---|---|---|
+| Tokio mutex, compared with level 1 | **65.2%** whole-command time: 84.4 to 29.4 s | **100%** (15/15) | **100%** (39/39) |
+| Base64, compared with a dependency-expanding reference | **83.6%** summed compiler time: 262.8 to 43.2 s | **97.3%** (71/73) | **92.2%** (106/115) |
 
-A **checking boundary** means Verus cannot currently use a referenced type, function, or trait because it is outside checking or has been explicitly excluded. This can happen inside your selected file as well as at a dependency. It is a checking obstacle, not automatically a Verus language or library-model gap. Level 1 keeps trying to work around these obstacles; level 2 stops when they are the only errors left, with no setup or instrumentation blocker. The report stays **partial** and retains those errors in `review.md`; more gaps may be hidden behind them.
+A full-Tokio level-2 scan retained **100% of the 560 known reference groups**: 22 language groups and 538 library/API-model groups. Groups are distinct diagnostic families or named APIs, not distinct Rust features; a primary group/location record pairs a group with an original source coordinate. These percentages measure retention of observed reference findings, **not exhaustive coverage of every gap**.
 
-Use **`--jobs N`** to scan files concurrently. The default is **1**. With more than one worker, the scanner uses a fixed-size pool of persistent **Python processes, not threads**: whichever becomes free takes the next file, rather than receiving a fixed chunk of files up front. Python file analysis does not compete for one shared GIL. Each file keeps its own exploration and repeated-confirmation state; rounds within a file remain sequential. The selected scope and scan level are unchanged; a single-worker scan still runs directly without starting a pool.
+The mutex comparison holds source, dependency lock, compiler, and scanner revision fixed; see [validation](VALIDATION.md#scan-levels). Base64 and full-Tokio reference comparisons use different scanner revisions, so they are not same-revision level-only benchmarks. Base64's time figure excludes setup and Python/report overhead. Shared-host measurements are examples, not guaranteed speedups or retention rates.
 
-```bash
-./verus-gap /path/to/crate --jobs 8 --verbose
-./verus-gap /path/to/crate --jobs 32 --verbose
-./verus-gap --resume /path/to/verus-gap-results/RESULT --jobs 32
-```
+All levels retain the same Cargo build context, source-preparation checks, and second-run confirmation of new support findings. Levels 1 and 2 check and report only selected source. The difference is exploration depth, not finding confidence.
 
-Cargo setup and build controls run once. The already parsed, cfg-prepared source models are cached once per pool and loaded independently once per process; workers do not repeat parsing or declaration/preparation indexing. Each process reuses its private writable source copy and independent render caches for later files, while compiler outputs remain separate and captured dependency/support artifacts remain shared inputs. A worker publishes an atomic checkpoint only after the round's initial and required confirmation evidence is fully written; unfinished runs and temporary checkpoint files are not included in reports. Only the coordinator writes the combined reports and checkpoint index; manual refresh shares the global report lock. Completed counts reflect finished files, not fixed worker partitions; report ordering follows the selected file order even when completion order differs. More workers use more CPU, memory and disk I/O, so choose a count appropriate for your machine rather than expecting linear speedup. The total timeout applies to the whole scan, not separately to each worker.
+A **checking boundary** means a referenced type, function, or trait is currently outside Verus checking or has been explicitly excluded. It can occur inside a selected file as well as at a dependency and is not automatically a missing language feature or library model. A level-2 boundary-only stop remains **partial**, with unresolved evidence in `review.md`; more gaps can be hidden behind it. Start a new result directory with `--scan-level 1` or `--scan-level 0` only if you need that additional investigation.
 
-The pool dispatches pending files by **descending original source byte count**, retaining selected order for equal sizes. This low-cost heuristic starts likely longer tasks earlier to reduce the final idle-worker tail; file size is not an exact runtime prediction. It does not change report ordering, file scope, isolation or repeated confirmation. Reports retain selected-file order (normally sorted paths) and sorted source locations. Single-worker scans keep their original order, and resume sorts only files that still need work. Under a total time budget, changing dispatch priority can change which files finish before the scan stops; unfinished coverage remains explicit. With `--verbose`, `[dispatch n/m]` counts files dispatched from this invocation's pending queue; the separate `[n/total]` completion line counts finished file frontiers, including reused ones.
+## Concurrency and live progress
 
-For the measured full-Tokio workload on a 96-core server, **32 workers is the balanced choice**: the larger-first scan took about 153 seconds versus 145 seconds with 64, while peak summed RSS rose from about 15 to 29 GiB. Choose 64 when those last seconds matter and the resources are available, not as a universal default. See [validation](VALIDATION.md#largest-source-first-dispatch) for the pinned comparison and its shared-host limits.
+**Use `--jobs 32 --verbose` as a starting point for multi-file scans on a machine with sufficient CPU and memory.** The CLI default is one worker; choose fewer workers on smaller or busy machines. Free workers take the next pending file, largest original source first, rather than receiving fixed file partitions. Reports retain selected-file order (normally sorted paths) and sorted locations, regardless of dispatch or completion order.
 
-`--jobs` may be changed on resume without changing the recorded scan level or reproving reusable file frontiers. Worker copies and their replay context are retained under `workers/`; they are not needed for evidence-only report refresh. During a pooled scan, worker restoration is not claimed until shutdown verifies the copies. Ctrl+C cancels queued work, stops running compiler processes, waits for source restoration, and saves all completed rounds, including each active file; repeated Ctrl+C during pool shutdown does not bypass restoration. A worker failure exits 2 and retains a stopped snapshot with its error and available evidence.
+For full Tokio on the measured server with 96 logical CPUs, 32 workers took **153.1 s** with about **15.2 GiB** peak summed RSS; 64 took **144.6 s** with about **28.6 GiB**. Doubling workers saved only another **5.5%** wall time, so 32 is the recommended resource/time balance for that workload. This is not a universal optimum; see [validation](VALIDATION.md#largest-source-first-dispatch).
 
-Add **`--verbose`** to see process initialization (cached model loading, private workspace copying, worker PID and readiness counts), live probe/confirmation phases, round timings, scope expansion or exclusion actions, cumulative group counts, and newly confirmed limitations with original error messages and source locations. Worker readiness and file dispatch are not completed-file counts:
+`--verbose` shows worker readiness, dispatched and completed files, probe/confirmation phases, round timings, and newly confirmed groups with original errors and locations. **Ready workers and dispatched files are not completed files**: `[dispatch n/m]` counts this invocation's pending queue, while `[n/total]` counts finished file frontiers, including reused ones. New gap notices appear only after confirmation evidence has been saved; repeated groups are not announced again.
 
-```bash
-./verus-gap /path/to/crate/src/write/encoder.rs --verbose
-./verus-gap --resume /path/to/verus-gap-results/RESULT --verbose
-```
-
-Output is flushed as progress becomes available, including through a file or pipe. A limitation is announced only after its confirmation and evidence have been saved. Repeated groups are not announced again; selected-source and dependency findings are labeled separately. Setup errors, checking boundaries and compiler failures are not announced as limitations. The final reports and raw evidence are still saved normally. Verbosity changes display only and can be enabled or disabled on resume.
-
-Reports are available as soon as setup finishes. During scanning, completed rounds and files refresh them only when at least one minute has elapsed and a new confirmed diagnostic/API group has been found since the previous automatic refresh. Repeated locations, checking boundaries, and progress changes alone do not trigger another full rewrite; file completion does not bypass these conditions. Normal exit always refreshes them immediately. A long-running probe or confirmation keeps the previous snapshot until the round finishes. **Ctrl+C** restores the scan copies and writes an **interrupted** report using the latest completed rounds, including findings from every active file. Pending files and unfinished frontiers stay visible; a partially completed confirmation is never counted as a confirmed gap.
-
-Refresh an existing result manually, including while a scan is running:
-
-```bash
-./verus-gap report /path/to/verus-gap-results/RESULT
-```
-
-This command reads retained original sources and saved checkpoints and rewrites only `report.md`, `review.md`, `report.json`, and `agent-tasks.json`. It does not run Cargo or Verus, resume the scan, change the recorded scanner/compiler identity, or require the original input or copied build workspace. Successful refresh exits 0 even when the report contains limitations; missing or inconsistent saved evidence is an error. Automatic and manual report writers are serialized, and files are replaced atomically so readers never see a partly written file. After forced termination or a crash, the manual command can rebuild a report from the last saved checkpoints; unlike Ctrl+C, a forced kill cannot run an exit handler.
-
-Resume validates the input, compiler and dependency identities, reuses completed work, and continues unfinished scans. `--out DIR` sets the result location; `--timeout SECONDS` changes the total build/scan budget (default: one hour).
-
-Resume inherits the recorded scan level when none is specified and rejects an explicitly different level. Level-2 boundary-only stops are deliberately finished under that policy, although coverage remains partial; resume reuses their evidence without another probe. Start a new output directory to change levels or investigate those boundaries further.
-
-Use trusted projects: Cargo build scripts and procedural macros execute in the copied workspace.
+Concurrency and verbosity do not change the selected scope or confirmation standard. Each file's rounds remain sequential, and more workers do not guarantee linear speedup. `--timeout SECONDS` sets the total build/scan budget (default: one hour), not a separate allowance per worker. A fixed budget can leave different files unfinished at different worker counts; that coverage remains explicit.
 
 ## Read the result
 
-Open the printed **`report.md`**. Its summary groups language rejections by error family and distinguishes your selected files from added dependency context. Detailed findings use public API names when available, original file locations, source excerpts, and unchanged compiler diagnostics. Source locations in `report.md` and `review.md` are clickable links to the unchanged source copies under `originals/`, with `#L` line anchors and visible line/column numbers. Line navigation depends on your Markdown viewer; keep `originals/` beside the reports when moving them. Unstable compiler definition numbers are normalized only for grouping, and different public APIs are kept separate. Counts are distinct diagnostic/API groups, **not counts of distinct Rust features or proved functions**.
+Open the printed **`report.md`**, including on a nonzero exit. It groups language rejections by error family and library/model gaps by public API when available, separating selected-source and dependency findings. Locations link to unchanged files under `originals/`, with visible line/column numbers and `#L` anchors; line navigation depends on your Markdown viewer. Keep `originals/` beside the reports when moving them.
 
 | File | Purpose |
 |---|---|
-| `report.md` / `report.json` | Reproduced gaps, selected/dependency scope, coverage, and remaining frontiers |
-| `review.md` | Local checking boundaries, migration requirements, instrumentation/setup problems, and compiler failures; not counted as support gaps |
-| `project.json` / `replay.json` | Build configuration, compiler/support identities, adaptation records, and exact replay context |
-| `shards/` | Every round's raw output, copied sources, source maps/edits, and confirmation run |
-| `workers/` | Private parallel source copies and their replay context |
+| `report.md` / `report.json` | Reproduced gaps, source scope, coverage, and remaining file frontiers |
+| `review.md` | Checking boundaries, migration requirements, setup/preparation problems, and compiler failures; not counted as support gaps |
+| `project.json` / `replay.json` | Build configuration, toolchain/dependency identities, adaptations, and replay commands |
+| `originals/` / `shards/` | Unchanged sources and every round's raw output, source overlay, edits, and confirmation evidence |
+| `workers/` | Private concurrent scan copies and their replay context |
 | `agent-tasks.json` | Bounded follow-up tasks for an optional agent |
 
-**Exit 0:** the selected frontiers cleared without accepted gaps. **Exit 1:** reproduced gaps were found; coverage may still be partial. **Exit 2:** setup failed, the scan budget left files pending, or only unresolved frontiers remain. Always inspect the report, including on nonzero exits.
+**Exit 0:** no accepted gaps and selected frontiers cleared. **Exit 1:** reproduced gaps found; coverage may still be partial. **Exit 2:** setup/scan failure, interruption, an exhausted budget, or unresolved frontiers without accepted gaps. An exit code is not a proof; inspect both findings and coverage.
 
-## What the scanner does—and does not establish
+## Refresh and resume
 
-The scanner checks that the unchanged Rust project builds, checks its source preparation with ordinary Rust, and smoke-tests Verus support before interpreting application errors. Each counted finding must map to the original checked source and reproduce in a second run of the same prepared code. It temporarily excludes blocked code in the scan copy to reveal later errors, recording every exclusion. Existing Verus annotations and Rust derives are preserved; setup and preparation failures are reported separately, not counted as application support gaps.
+Reports are available after setup. During scanning, completed rounds refresh them when **at least one minute has elapsed and a new confirmed group has appeared** since the previous automatic refresh. Repeated locations or progress alone do not trigger a rewrite. Normal exit always refreshes the reports; an in-progress round keeps the previous snapshot, and a partially completed confirmation is never counted as a gap.
+
+**Ctrl+C** stops active compilers, waits for scan-copy restoration, and writes an **interrupted** snapshot of completed rounds, including saved findings from active files. Pending files and unfinished frontiers remain visible. A scan failure exits 2 with its error and available evidence; a forced kill cannot run restoration handlers.
+
+```bash
+./verus-gap report /path/to/verus-gap-results/RESULT
+./verus-gap --resume /path/to/verus-gap-results/RESULT --jobs 32 --verbose
+```
+
+`report` refreshes from retained originals and saved checkpoints, even during a scan. It rewrites only `report.md`, `review.md`, `report.json`, and `agent-tasks.json`; it does not run Cargo/Verus or resume scanning. Keep `project.json`, `originals/`, and `shards/`; the original input and copied build workspace are not required. Successful refresh exits 0 even if the inventory contains gaps; missing or inconsistent evidence is an error.
+
+Resume validates the input, compiler, and dependency identities, reuses eligible saved frontiers, and continues unfinished investigation. You may change jobs, verbosity, or the total timeout, but not the saved scan level. Deliberately finished level-2 boundary-only frontiers are reused without another probe and remain partial. Start a new scan to change level, input, features, target, or Verus version. `--out DIR` chooses a result location.
+
+## Scope and safety
+
+Use trusted projects: Cargo build scripts and procedural macros execute in the copied workspace. The scanner validates unchanged Rust, source preparation, and Verus support before accepting application findings. Each counted support finding maps to checked original source and reproduces in a second run of the same prepared code. Blocked bodies or declarations can be temporarily excluded in the copy to reveal later errors; every exclusion is recorded. Existing Verus annotations and Rust derives are preserved.
 
 Existing Verus-aware dependencies use official Cargo-Verus. Any support-version alignment happens **only in the scan copy**, with a recorded manifest diff and another Rust build check. Custom targets retain their actual target and build options; the tool does not silently switch to the host or disable proof lifetime checks. SMT proof verification is off during scanning.
 
-**This is a compatibility investigation, not a proof or exhaustive inventory.** File shards retain the Rust dependency context, but unwrapped/generated items can remain checking boundaries. Scope expansion is conservative source indexing, not a semantic call graph. Early signature/trait/macro/compiler failures and excluded bodies can hide more gaps. Clearing a frontier after exclusions does not mean the original program is supported or verified. A library finding means its model was not recognized in the recorded configuration—not that no model exists anywhere or that the API is inherently unverifiable.
+**This is a compatibility investigation, not a proof or exhaustive inventory.** Generated items, checking boundaries, compiler failures, and exclusions can hide more gaps. Clearing a frontier after exclusions does not mean the original program is supported or verified. A library finding means its model was not recognized in the recorded configuration, not that no model exists anywhere or that the API is inherently unverifiable. Counts are not proof or function-coverage counts.
 
 External path dependencies, generated assets, and unusual platform setup may require a self-contained prepared copy. The tool refuses to copy your home/filesystem root or follow symlinks outside the workspace. Failed setup is reported, never relabeled as an application gap.
 
