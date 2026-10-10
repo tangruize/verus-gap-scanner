@@ -62,7 +62,7 @@ For a small built-in check, run `./verus-gap demo`. It intentionally reports mis
 | `1` | Stay in selected source and continue working around checking boundaries | Investigate gaps that may be hidden behind a boundary |
 | `0` | Also investigate resolvable local dependencies needed to continue checking | Include dependency findings, labeled separately |
 
-Measured comparisons show about **65% less end-to-end time**, with **over 95% of known gap groups** and **over 90% of their source locations** retained. Actual results vary by project; these are observed results, not an exhaustive coverage guarantee. See [measurement details](VALIDATION.md#scan-levels) if needed.
+Measured comparisons show about **65% less end-to-end time**, with **over 95% of known gap groups** and **over 90% of their source locations** retained. Actual results vary by project; these are observed results, not an exhaustive coverage guarantee. See [measurement details](doc/VALIDATION.md#scan-levels) if needed.
 
 All levels retain the same Cargo build context, source-preparation checks, and second-run confirmation of new support findings. Levels 1 and 2 check and report only selected source. The difference is exploration depth, not finding confidence.
 
