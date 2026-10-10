@@ -4,35 +4,44 @@ Find Rust constructs and library APIs that **the installed Verus cannot check in
 
 ## Install once
 
-Requires **Python 3.11+ and Rustup/Cargo**. Linux x86-64 is tested; the official installer also supports macOS x86-64/ARM64.
+Run the commands below from this tool directory. Requires **Python 3.11+ and Rustup/Cargo**. Linux x86-64 is tested; the official installer also supports macOS x86-64/ARM64.
 
 ```bash
 ./setup
 ```
 
-Setup creates a local `.venv`, installs the declared Python dependencies, downloads the **latest official Verus release** with its published SHA-256, installs the matching Rust toolchain if necessary, and runs a Verus/vstd/Z3 smoke proof. It does not change your default Rust toolchain. The chosen release stays fixed until you run setup again.
-
-Already have a complete Verus distribution? Use `./setup --verus /absolute/path/to/verus`. For reproducibility, use `./setup --release VERSION`.
+Setup installs the local Python environment and latest official Verus release with matching Rust, then checks the toolchain. It does not change your default Rust toolchain.
 
 ## Scan
 
-Try Tokio after setup. Run these commands from the tool directory, choosing an unused clone destination:
+Try Tokio after setup, choosing an unused clone destination:
 
 ```bash
 git clone --depth 1 https://github.com/tokio-rs/tokio.git "$HOME/tokio-verus-gap"
 ./verus-gap "$HOME/tokio-verus-gap/tokio" --jobs 32 --verbose
 ```
 
-This selects the Tokio library crate inside the cloned workspace, enables its `full` feature, and scans with live progress and up to 32 concurrent file workers. **Scan level 2 is the default and the recommended first pass**; no level option is needed.
+This selects the Tokio library crate, enables its `full` feature, and shows live progress. **Level 2 is the recommended default**; no level option is needed. Use fewer than 32 jobs on smaller or busy machines.
 
-For your own project or a small built-in example:
+For your own crate:
 
 ```bash
 ./verus-gap /absolute/path/to/your/crate --jobs 32 --verbose
-./verus-gap demo
 ```
 
-The demo intentionally reports missing `std::time::Instant` models and exits 1. For a real crate, the scanner discovers Cargo, builds the unchanged code with Verus's matching Rust, and scans active source. A crate-defined `full` feature is selected automatically unless you choose features explicitly; otherwise Cargo's default features are retained.
+Use trusted projects: Cargo build scripts and procedural macros execute in the scan copy.
+
+**Then open the printed `report.md` path.** It contains the confirmed gaps, source locations, and coverage limits. Exit **1** means gaps were found, not that installation failed. For normal use, this is all you need.
+
+---
+
+## Optional reading
+
+The sections below are reference material for custom scopes, deeper investigation, troubleshooting, or replay. You do not need them for a normal scan.
+
+### Select sources and Cargo options
+
+The scanner discovers Cargo, builds unchanged code with Verus's matching Rust, and scans active source. A crate-defined `full` feature is selected automatically unless you choose features explicitly; otherwise Cargo's default features are retained.
 
 A file or subdirectory inside a crate selects that scope **without losing the containing crate's dependencies**, target, generated files, or build options. It is not treated as a dependency-free snippet. A standalone `.rs` file works too. Use `--package NAME` for an ambiguous workspace, `--bin NAME` for a specific binary, and repeat `--file RELATIVE_PATH_OR_GLOB` to select files. Choose features with `--features FEATURE`, or pass normal Cargo options after `--`.
 
@@ -41,7 +50,9 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 ./verus-gap /path/to/workspace --package my_crate -- --no-default-features
 ```
 
-## Choose a scan level
+For a small built-in check, run `./verus-gap demo`. It intentionally reports missing `std::time::Instant` models and exits 1.
+
+### Choose a scan level
 
 **Keep the default level 2 for a normal gap inventory.** Levels 1 and 0 spend additional time exploring checking obstacles; use them only when you specifically need deeper selected-source investigation or dependency findings.
 
@@ -57,7 +68,7 @@ All levels retain the same Cargo build context, source-preparation checks, and s
 
 A **checking boundary** means a referenced type, function, or trait is currently outside Verus checking or has been explicitly excluded. It can occur inside a selected file as well as at a dependency and is not automatically a missing language feature or library model. A level-2 boundary-only stop remains **partial**, with unresolved evidence in `review.md`; more gaps can be hidden behind it. Start a new result directory with `--scan-level 1` or `--scan-level 0` only if you need that additional investigation.
 
-## Concurrency and live progress
+### Concurrency and live progress
 
 **Use `--jobs 32 --verbose` as a starting point for multi-file scans on a machine with sufficient CPU and memory.** The CLI default is one worker; choose fewer workers on smaller or busy machines. Free workers take the next pending file, largest original source first, rather than receiving fixed file partitions. Reports retain selected-file order (normally sorted paths) and sorted locations, regardless of dispatch or completion order.
 
@@ -65,9 +76,9 @@ A **checking boundary** means a referenced type, function, or trait is currently
 
 Concurrency and verbosity do not change the selected scope or confirmation standard. Each file's rounds remain sequential, and more workers do not guarantee linear speedup. `--timeout SECONDS` sets the total build/scan budget (default: one hour), not a separate allowance per worker. A fixed budget can leave different files unfinished at different worker counts; that coverage remains explicit.
 
-## Read the result
+### Evidence and exit codes
 
-For normal use, **read `report.md`**: it contains the findings, coverage summary, and unfinished file frontiers. Read it even on a nonzero exit. It groups language rejections by error family and library/model gaps by public API, separating selected-source and dependency findings. Counts are diagnostic/API groups, not distinct Rust features or proved functions.
+`report.md` groups language rejections by error family and library/model gaps by public API, separating selected-source and dependency findings. Counts are diagnostic/API groups, not distinct Rust features or proved functions.
 
 **`review.md` is optional troubleshooting material**, not routine reading. Open it when investigating a setup/compiler failure or why particular code remains unchecked; a partial scan alone does not require reading it. The other files below retain evidence for deeper analysis and replay.
 
@@ -84,7 +95,7 @@ Locations link to unchanged files under `originals/`, with visible line/column n
 
 **Exit 0:** no accepted gaps and selected frontiers cleared. **Exit 1:** reproduced gaps found; coverage may still be partial. **Exit 2:** setup/scan failure, interruption, an exhausted budget, or unresolved frontiers without accepted gaps. An exit code is not a proof; inspect both findings and coverage.
 
-## Refresh and resume
+### Refresh and resume
 
 Reports are available after setup. During scanning, completed rounds refresh them when **at least one minute has elapsed and a new confirmed group has appeared** since the previous automatic refresh. Repeated locations or progress alone do not trigger a rewrite. Normal exit always refreshes the reports; an in-progress round keeps the previous snapshot, and a partially completed confirmation is never counted as a gap.
 
@@ -99,7 +110,7 @@ Reports are available after setup. During scanning, completed rounds refresh the
 
 Resume validates the input, compiler, and dependency identities, reuses eligible saved frontiers, and continues unfinished investigation. You may change jobs, verbosity, or the total timeout, but not the saved scan level. Deliberately finished level-2 boundary-only frontiers are reused without another probe and remain partial. Start a new scan to change level, input, features, target, or Verus version. `--out DIR` chooses a result location.
 
-## Scope and safety
+### Scope and safety
 
 Use trusted projects: Cargo build scripts and procedural macros execute in the copied workspace. The scanner validates unchanged Rust, source preparation, and Verus support before accepting application findings. Each counted support finding maps to checked original source and reproduces in a second run of the same prepared code. Blocked bodies or declarations can be temporarily excluded in the copy to reveal later errors; every exclusion is recorded. Existing Verus annotations and Rust derives are preserved.
 
@@ -110,5 +121,11 @@ Existing Verus-aware dependencies use official Cargo-Verus. Any support-version 
 External path dependencies, generated assets, and unusual platform setup may require a self-contained prepared copy. The tool refuses to copy your home/filesystem root or follow symlinks outside the workspace. Failed setup is reported, never relabeled as an application gap.
 
 Use the optional [agent skill](.github/skills/verus-gap/SKILL.md) to guide an agent through scanning and interpreting the evidence, or run the command directly in your terminal.
+
+### Other setup options
+
+Setup validates the official release's published SHA-256 and runs a Verus/vstd/Z3 smoke proof. The chosen release stays fixed until you run setup again.
+
+Already have a complete Verus distribution? Use `./setup --verus /absolute/path/to/verus`. To pin a release, use `./setup --release VERSION`.
 
 For Python package installation, `pip install .` also provides `verus-gap` and `verus-gap-setup`; its toolchain cache is `$XDG_CACHE_HOME/verus-gap` (or `~/.cache/verus-gap`, override with `VERUS_GAP_HOME`). The checkout's two commands use its local `.tools` directory.
