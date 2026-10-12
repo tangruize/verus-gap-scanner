@@ -15,6 +15,23 @@ A file or subdirectory inside a crate selects that scope **without losing the co
 
 For a small built-in check, run `./verus-gap demo`. It intentionally reports missing `std::time::Instant` models and exits 1.
 
+### Code with existing Verus annotations
+
+The default Rust input mode resolves original source `cfg` / `cfg_attr` against the captured native compiler configuration before adding scanner instrumentation. Ghost-only contracts and proof blocks that the native build disables stay disabled, including in unselected context files; their executable functions are still scanned. Explicitly enabled native configuration remains enabled. Source configuration is retained for workers, resume, and offline report reconstruction; old results retain their original ghost-enabled interpretation.
+
+For crates that require Cargo-Verus dependency setup, the source view instead uses the actual captured Verus driver's cfg, matching the ghost-aware dependency artifacts. Required proof/spec definitions must remain available to existing Verus macros. Conditions involving `verus_keep_ghost_body` remain available to the driver's checking and ghost-erasure passes rather than being frozen to the first pass. The report labels this exception as a Cargo-Verus source view and retains the original native build controls separately; it does not claim that native-only branches are covered by the ghost-aware run.
+
+For an existing Verus proof root, use the explicit Verus input mode instead:
+
+```bash
+./verus-gap /path/to/project/proof_root.rs --input-kind verus --jobs 32 --verbose
+./verus-gap /path/to/project/proof_root.rs --input-kind verus --jobs 32 -- --extern dependency=/absolute/path/to/libdependency.rlib
+```
+
+This mode compiles the supplied `.rs` root without Cargo metadata or dependency selection. A nearest ancestor Cargo manifest, if present, determines only the snapshot boundary, preserving sibling modules imported through `#[path]`; otherwise the root's directory is copied. Its unchanged-build and preparation controls use Verus compilation with SMT disabled, not ordinary Rust compilation. It preserves the root's ghost configuration, contracts, proofs, and existing trust boundaries. Existing `verus!`, `state_machine!`, and `tokenized_state_machine!` blocks are not nested inside another `verus!` wrapper. Native dependencies must be built with the installed Verus release's matching Rust toolchain; Cargo selectors and features are not accepted in this mode.
+
+A clear Verus-input scan means the installed compiler accepted the retained checking context without SMT verification. It does not re-prove existing proofs, check bodies marked external, or establish support for all equivalent unannotated Rust. Macro-contained declarations remain opaque to the scanner's function index and body isolation. Arbitrary macro tokens are not rewritten to resolve their internal conditional compilation. A build configuration cannot automatically combine separate proof roots or repair mismatched library/toolchain versions.
+
 ## Optional build configuration
 
 **Use a configuration only when the project needs build settings that ordinary Cargo defaults do not supply**, such as Makefile-provided features, a custom target, `build-std` options, or build-script environment variables. An unchanged-Rust setup failure is not a Verus gap. Read the actual metadata/build error and `baseline.stdout` / `baseline.stderr` first; a configuration cannot repair invalid Rust, missing tools/assets, or an unsupported Verus construct.

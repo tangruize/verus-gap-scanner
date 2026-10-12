@@ -15,7 +15,8 @@ from pathlib import Path
 import tomlkit
 
 from .gap import GapError, PACKAGE, capture_wrapper, run, save_run, verus_args
-from .project import Project, save_replay
+from .project import Project, compiler_cfg, save_replay, source_configuration
+from .source import Source
 from .target import official_sources
 
 
@@ -227,6 +228,19 @@ def configure_dependencies(project: Project, package: dict, metadata: dict):
     project.manifest["dependency_setup"]["captured_root_without_execution"] = True
     project.manifest["dependency_setup"]["probe_emit"] = "metadata"
     project.manifest["compiler_args"] = compiler
+    if "source_cfg" in project.manifest:
+        project.manifest["source_cfg"] = compiler_cfg(
+            compiler, project.cwd, project.env, output,
+            project.deadline - time.monotonic(), driver=[str(verus), captured["compiler"]],
+        )
+        project.manifest["source_configuration_origin"] = "cargo_verus"
+        cfg = source_configuration(project.manifest)
+        project.sources = {
+            name: Source(name, source.data, cfg) for name, source in project.sources.items()
+        }
+        project.manifest["active_sources"] = {
+            name: source.identity() for name, source in project.sources.items()
+        }
     artifacts = {
         Path(value.split("=", 1)[1])
         for index, value in enumerate(compiler)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import tomllib
@@ -8,9 +9,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from verus_gap.dependencies import align_manifest, cargo_arguments, fresh_capture, requires_ghost_dependencies
+from verus_gap.gap import GapError
+from verus_gap.project import resume
 
 
 class DependencySetupTests(unittest.TestCase):
+    def test_resume_rejects_native_source_cfg_paired_with_ghost_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "project.json").write_text(json.dumps({
+                "schema": "verus-gap/project-v2", "baseline_passed": True,
+                "support_mode": "cargo_verus_ghost_dependencies",
+                "source_cfg": [], "source_configuration_origin": "native",
+            }))
+            with self.assertRaisesRegex(GapError, "does not match its Cargo-Verus dependencies"):
+                resume(root, 30)
+
     def test_only_registered_support_dependencies_are_aligned(self):
         old = (
             '# retain this comment\n[package]\nname="example"\nversion="0.1.0"\n'

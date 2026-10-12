@@ -164,6 +164,36 @@ class RealAdaptationTests(unittest.TestCase):
         adapted, _ = self.compile(source)
         self.assertEqual(adapted["exit_code"], 0, adapted["stderr"])
 
+    def test_inactive_braced_macro_preserves_rust_tail_return(self):
+        for suffix, result_type in (
+            ("(1, 2)", "(u32, u32)"),
+            ("((1, 2))", "(u32, u32)"),
+            ("/* retained */ (1, 2).0", "u32"),
+            ("{ (1, 2) }", "(u32, u32)"),
+        ):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory)
+                original = (
+                    f"pub fn example() -> {result_type} {{\n"
+                    "#[cfg(any())]\nunknown! { unused(); }\n"
+                    f"{suffix}\n}}\n"
+                ).encode()
+                file = cwd / "lib.rs"
+                model = Source("lib.rs", original, Cfg([]))
+                for data in (original, model.render(set(), set(), wrap=False).data):
+                    file.write_bytes(data)
+                    result = run(
+                        ["rustc", str(file), "--crate-type=lib", "--emit=metadata"],
+                        cwd, self.env, 30,
+                    )
+                    self.assertEqual(result["exit_code"], 0, result["stderr"])
+                file.write_bytes(model.render(set(), set()).data)
+                result = run(
+                    [str(self.verus), str(file), "--crate-type=lib", "--no-verify"],
+                    cwd, self.env, 30,
+                )
+                self.assertEqual(result["exit_code"], 0, result["stderr"])
+
     def test_cfg_field_and_parameter_owners(self):
         source = (
             "pub struct S { #[cfg(windows)] pub a: u32, "

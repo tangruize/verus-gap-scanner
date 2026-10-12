@@ -80,7 +80,7 @@ class Project:
 
 
 def compiler_cfg(args: list[str], cwd: Path, env: dict, output: Path,
-                 timeout: float) -> list[str]:
+                 timeout: float, driver: list[str] | None = None) -> list[str]:
     flags, index = [], 0
     while index < len(args):
         arg = args[index]
@@ -92,7 +92,7 @@ def compiler_cfg(args: list[str], cwd: Path, env: dict, output: Path,
             index += 1
         else:
             index += 1
-    result = run(["rustc", "--print=cfg", *flags], cwd, env, timeout)
+    result = run([*(driver or ["rustc"]), "--print=cfg", *flags], cwd, env, timeout)
     save_run(output, "cfg", result)
     if result["exit_code"] or result["timed_out"]:
         raise GapError("Cannot determine the actual compiler cfg; see cfg.stderr.")
@@ -106,6 +106,7 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     output.mkdir(parents=True, exist_ok=True)
     verus = find_verus(args.verus)
     version = identity(verus)
+    input_kind = getattr(args, "input_kind", None) or "rust"
     deadline = time.monotonic() + args.timeout
     env = dict(os.environ, RUSTUP_TOOLCHAIN=version["toolchain"], CARGO_BUILD_JOBS="4")
     for key in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_MAKEFLAGS"):
@@ -117,7 +118,7 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     standalone = path.suffix == ".rs"
     ghost_dependencies = False
     manifest_path = None
-    if standalone and not getattr(args, "standalone", False):
+    if standalone and input_kind != "verus" and not getattr(args, "standalone", False):
         for parent in path.parents:
             if (parent / "Cargo.toml").is_file():
                 manifest_path = parent / "Cargo.toml"
@@ -125,6 +126,11 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
                 break
     if standalone:
         source_root, root = path.parent, path
+        if input_kind == "verus":
+            source_root = next(
+                (parent for parent in path.parents if (parent / "Cargo.toml").is_file()),
+                source_root,
+            )
         package, target = None, None
         if configuration is not None and (
             configuration.package or configuration.binary or configuration.arguments or configuration.rustflags
@@ -187,6 +193,8 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     copied_root = workspace / root.relative_to(source_root)
     record = {
         "schema": "verus-gap/project-v2", "input": str(path),
+        "input_kind": input_kind,
+        "baseline_kind": "verus_compile" if input_kind == "verus" else "rust",
         "workspace_root": str(source_root),
         "root_source": str(root.relative_to(source_root)),
         "package": package["name"] if package else root.stem,
@@ -226,6 +234,10 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
             "rustc", *compiler, "--emit=dep-info,metadata",
             "--out-dir", str(output / "build"),
         ]
+        if input_kind == "verus":
+            baseline_command = [
+                str(verus), "--no-verify", "--compile", *baseline_command[1:],
+            ]
         (output / "build").mkdir()
         baseline_env = env
     else:
@@ -255,8 +267,9 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     record["baseline"] = save_run(output, "baseline", baseline)
     write_json(output / "project.json", record)
     if baseline["exit_code"] or baseline["timed_out"]:
+        build = "Verus compile" if input_kind == "verus" else "Rust build"
         raise GapError(
-            "The unchanged Rust build failed; no Verus limitation was inferred. "
+            f"The unchanged {build} failed; no Verus limitation was inferred. "
             "See baseline.stdout and baseline.stderr for the actual build error.\n"
             + CONFIGURATION_HELP
         )
@@ -267,7 +280,10 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         record["dependency_lock_sha256"] = hashlib.sha256(lock.read_bytes()).hexdigest()
     if standalone:
         cwd = workspace
-        captured = {"args": baseline_command[1:], "cwd": str(cwd)}
+        captured = {
+            "args": [*compiler, "--emit=dep-info,metadata", "--out-dir", str(output / "build")],
+            "cwd": str(cwd),
+        }
     else:
         capture_path = output / "capture.json"
         if not capture_path.is_file():
@@ -282,10 +298,15 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
     )
     cfg_values = compiler_cfg(compiler, cwd, env, output, deadline - time.monotonic())
     record["rust_cfg"] = cfg_values
+    source_cfg = cfg_values
+    if input_kind == "verus":
+        source_cfg = [*cfg_values, "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"]
     copied_files = active_sources(captured, copied_root)
     outside = [str(file) for file in copied_files if not file.is_relative_to(workspace)]
     record["external_active_sources"] = outside
-    scan_cfg = Cfg([*cfg_values, "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
+    record["source_cfg"] = source_cfg
+    record["source_configuration_origin"] = "verus_root" if input_kind == "verus" else "native"
+    scan_cfg = source_configuration(record)
     sources = {
         str(file.relative_to(workspace)): Source(
             str(file.relative_to(workspace)), file.read_bytes(), scan_cfg,
@@ -298,6 +319,15 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         backup.write_bytes(source.data)
     record["active_sources"] = {name: source.identity() for name, source in sources.items()}
     record["native_compiler_args"] = verus_args(captured["args"], keep_support=True)
+    for index, argument in enumerate(compiler[:-1]):
+        if argument == "--extern" and "=" in compiler[index + 1]:
+            artifact = Path(compiler[index + 1].split("=", 1)[1])
+            if not artifact.is_absolute():
+                artifact = cwd / artifact
+            if artifact.is_file() and not artifact.resolve().is_relative_to(workspace):
+                record.setdefault("dependency_artifacts_sha256", {})[str(artifact.resolve())] = (
+                    hashlib.sha256(artifact.read_bytes()).hexdigest()
+                )
     record["native_environment"] = captured.get("environment", {})
     command = [
         str(verus), *compiler, "--no-verify", "--error-format=json", "--color=never",
@@ -317,7 +347,8 @@ def prepare(args: argparse.Namespace, cargo_args: list[str], output: Path) -> Pr
         from .dependencies import configure_dependencies
         configure_dependencies(project, package, meta)
     save_replay(project)
-    print(f"Rust baseline passed; {len(sources)} active files, "
+    label = "Verus compile" if input_kind == "verus" else "Rust"
+    print(f"{label} baseline passed; {len(sources)} active files, "
           f"{sum(len(source.functions) for source in sources.values())} enumerable functions.", flush=True)
     return project
 
@@ -335,10 +366,21 @@ def archive_tools(output: Path, hashes: dict):
             saved.write_bytes(data)
 
 
+def source_configuration(record: dict) -> Cfg:
+    # Old reports used a ghost-enabled source view; keep their evidence interpretable.
+    values = record.get("source_cfg", [
+        *record["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only",
+    ])
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise GapError("The saved source configuration is invalid.")
+    return Cfg(values)
+
+
 def check_preparation(project: Project):
     output = project.output / "preparation-check" / str(time.time_ns())
     output.mkdir(parents=True)
-    cfg = Cfg(project.manifest["rust_cfg"])
+    verified = project.manifest.get("input_kind") == "verus"
+    cfg = source_configuration(project.manifest) if verified else Cfg(project.manifest["rust_cfg"])
     prepared, patches = [], []
     try:
         for name, source in project.sources.items():
@@ -350,8 +392,9 @@ def check_preparation(project: Project):
                 patches.append(rendered.patch())
         (output / "overlay.diff").write_text("".join(patches))
         env = dict(project.env, **project.manifest["native_environment"])
+        driver = [project.command[0], "--no-verify", "--compile"] if verified else ["rustc"]
         result = run([
-            "rustc", *project.manifest["native_compiler_args"],
+            *driver, *project.manifest["native_compiler_args"],
             "--emit=metadata", "--cap-lints=warn", "--out-dir", str(output),
         ], project.cwd, env, project.deadline - time.monotonic())
         project.manifest["preparation_check"] = {
@@ -362,7 +405,7 @@ def check_preparation(project: Project):
         project.save()
         if result["exit_code"] or result["timed_out"]:
             raise GapError(
-                "Syntax-only preparation failed its ordinary Rust recheck. "
+                "Syntax-only preparation failed its unchanged-build recheck. "
                 f"No preparation errors were counted as Verus limitations; see {output / 'rustc.stderr'}."
             )
     finally:
@@ -390,7 +433,11 @@ def save_replay(project: Project):
 def resume(output: Path, timeout: float) -> Project:
     record = json.loads((output / "project.json").read_text())
     if record["schema"] != "verus-gap/project-v2" or not record["baseline_passed"]:
-        raise GapError("This result does not contain a successful reusable Rust baseline.")
+        raise GapError("This result does not contain a successful reusable build baseline.")
+    if "source_cfg" in record and record.get("support_mode") == "cargo_verus_ghost_dependencies" and (
+        record.get("source_configuration_origin") != "cargo_verus"
+    ):
+        raise GapError("Saved source cfg does not match its Cargo-Verus dependencies. Start a new scan.")
     validate_saved_configuration(output, record.get("build_configuration"))
     replay = json.loads((output / "replay.json").read_text())
     configuration = record.get("build_configuration")
@@ -410,7 +457,7 @@ def resume(output: Path, timeout: float) -> Project:
         file = origin / name
         if not file.is_file() or hashlib.sha256(file.read_bytes()).hexdigest() != digest:
             raise GapError(f"Input changed since this baseline: {name}. Start a new scan.")
-    cfg = Cfg([*record["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
+    cfg = source_configuration(record)
     sources = {}
     for name, source_record in record["active_sources"].items():
         raw = (output / "originals" / name).read_bytes()

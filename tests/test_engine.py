@@ -19,7 +19,8 @@ from verus_gap.engine import (
     DependencyIndex, State, canonical, classify, compiler_panic, dependencies, execute,
     parse_output, probe, record_key,
 )
-from verus_gap.gap import TimeBudgetExhausted, run
+from verus_gap.gap import TimeBudgetExhausted, find_verus, identity, run
+from verus_gap.target import official_sources
 from verus_gap.source import Cfg, Source
 
 
@@ -510,6 +511,92 @@ class ClassificationTests(unittest.TestCase):
 
 @unittest.skipUnless((ROOT / ".tools/installation.json").is_file(), "run ./setup")
 class RealInventoryTests(unittest.TestCase):
+    def test_cargo_verus_dependencies_keep_their_required_source_definitions(self):
+        source = official_sources(identity(find_verus(None))["commit"])
+        version = tomllib.loads((source / "source/vstd/Cargo.toml").read_text())["package"]["version"]
+        files = {
+            "Cargo.toml": (
+                '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n'
+                '[package.metadata.verus]\nverify=true\n'
+                f'[dependencies]\nvstd="={version}"\n'
+            ),
+            "src/lib.rs": (
+                "use vstd::prelude::*;\n"
+                "#[cfg(verus_keep_ghost)]\n"
+                "verus! { pub open spec fn model() -> u32 { 1 } }\n"
+                "verus! { pub fn value() -> (r: u32) ensures r == model() { 1 } }\n"
+                "#[verus_verify] pub struct S {\n"
+                "#[cfg(verus_keep_ghost_body)] ghost: Ghost<u32>, value: u32 }\n"
+                "#[verus_verify] pub fn make() -> S {\n"
+                "proof_with! {ghost: Ghost(0u32)}; S { value: 1 } }\n"
+            ),
+        }
+        process, output = self.scan(files, "--jobs", "32")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        manifest = json.loads((output / "project.json").read_text())
+        report = json.loads((output / "report.json").read_text())
+        self.assertNotIn("verus_keep_ghost", manifest["rust_cfg"])
+        self.assertIn("verus_keep_ghost", manifest["source_cfg"])
+        self.assertEqual(manifest["source_configuration_origin"], "cargo_verus")
+        self.assertEqual(report["source_configuration_origin"], "cargo_verus")
+        self.assertEqual(report["counts"], {})
+        self.assertIn("Cargo-Verus dependency context", (output / "report.md").read_text())
+
+    def test_native_source_view_does_not_activate_proofs_in_unselected_context(self):
+        files = {
+            "Cargo.toml": '[package]\nname="fixture"\nversion="0.1.0"\nedition="2021"\n',
+            "src/lib.rs": "mod selected;\nmod helper;\n",
+            "src/selected.rs": (
+                "#[cfg_attr(verus_keep_ghost, verus_spec(ensures missing_model()))]\n"
+                "pub fn selected() { let _ = std::time::Instant::now(); }\n"
+            ),
+            "src/helper.rs": (
+                "#[cfg(verus_keep_ghost)] use crate::missing_specs;\n"
+                "pub fn helper() { #[cfg(verus_keep_ghost)] proof! { missing(); } }\n"
+            ),
+        }
+        process, output = self.scan(files, "--jobs", "32", "--file", "src/selected.rs")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        self.assertGreater(report["counts"].get("library_specification", 0), 0)
+        self.assertNotIn("instrumentation_failure", report["counts"])
+        self.assertNotIn("rust_or_wrapper_blocker", report["counts"])
+        manifest = json.loads((output / "project.json").read_text())
+        self.assertEqual(manifest["source_cfg"], manifest["rust_cfg"])
+
+    def test_explicit_verus_root_ignores_cargo_metadata_and_can_resume(self):
+        files = {
+            "Cargo.toml": (
+                '[package]\nname="proof_fixture"\nversion="0.1.0"\n'
+                '[dependencies]\nmissing={path="missing"}\n'
+            ),
+            "proofs/root.rs": (
+                "use vstd::prelude::*;\n#[path = \"../src/helper.rs\"] mod helper;\n"
+                "verus! { pub fn value() -> (result: u32) ensures result == 1 { 1 } }\n"
+            ),
+            "src/helper.rs": "use vstd::prelude::*;\nverus! { pub fn helper() -> u32 { 2 } }\n",
+        }
+        process, output = self.scan(
+            files, "--input-kind", "verus", "--jobs", "32", target_relative="proofs/root.rs",
+        )
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        report = json.loads((output / "report.json").read_text())
+        self.assertEqual(report["baseline_kind"], "verus_compile")
+        self.assertEqual(report["coverage"]["probed_files"], 2)
+        self.assertEqual(report["coverage"]["partial_files"], 0)
+        self.assertIn("Unchanged Verus compile", (output / "report.md").read_text())
+        resumed = subprocess.run(
+            [str(ROOT / "verus-gap"), "--resume", str(output), "--jobs", "32"],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        refreshed = subprocess.run(
+            [str(ROOT / "verus-gap"), "report", str(output)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(refreshed.returncode, 0, refreshed.stdout + refreshed.stderr)
+        self.assertEqual(json.loads((output / "report.json").read_text())["input_kind"], "verus")
+
     def scan(self, files: dict[str, str], *options: str, target_relative: str | None = None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

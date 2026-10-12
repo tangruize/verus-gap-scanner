@@ -19,6 +19,19 @@ from verus_gap.project import scan_level_from
 
 
 class ScanLevelTests(unittest.TestCase):
+    def test_verus_input_requires_a_proof_root_and_rejects_cargo_selectors(self):
+        for options in (
+            ["project", "--input-kind", "verus"],
+            ["lib.rs", "--input-kind", "verus", "--features", "full"],
+            ["lib.rs", "--input-kind", "verus", "--package", "fixture"],
+            ["lib.rs", "--input-kind", "verus", "--bin", "fixture"],
+        ):
+            with self.subTest(options=options), mock.patch("verus_gap.cli.prepare") as preparing:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as failure:
+                    main(options)
+                self.assertEqual(failure.exception.code, 2)
+                preparing.assert_not_called()
+
     def test_default_and_explicit_numeric_levels_reach_the_engine(self):
         cases = [
             ([], 2), (["--scan-level", "0"], 0), (["--scan-level", "1"], 1),

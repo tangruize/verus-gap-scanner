@@ -9,10 +9,59 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from verus_gap.gap import GapError
+from verus_gap.project import source_configuration
 from verus_gap.source import Cfg, Edit, Source, apply_edits
 
 
 class SourceTests(unittest.TestCase):
+    def test_verus_ghost_body_conditions_remain_available_to_erasure(self):
+        original = (
+            "struct S { #[cfg(verus_keep_ghost_body)] ghost: Ghost<u32>, value: u32 }\n"
+            "#[cfg(not(verus_keep_ghost_body))] fn erased_only() {}\n"
+        ).encode()
+        cfg = Cfg(["verus_keep_ghost", "verus_keep_ghost_body"])
+        prepared = Source("lib.rs", original, cfg).render(set(), set(), wrap=False).data
+        self.assertEqual(prepared, original)
+        native = Source("lib.rs", original, Cfg([])).render(set(), set(), wrap=False).data
+        self.assertNotIn(b"ghost:", native)
+        self.assertIn(b"fn erased_only()", native)
+
+    def test_existing_verus_and_state_machine_macros_are_not_double_wrapped(self):
+        for name in ("verus", "vstd::prelude::verus", "state_machine", "tokenized_state_machine"):
+            with self.subTest(name=name):
+                original = f"{name}! {{ pub fn f() {{}} }}\npub fn ordinary() {{}}\n".encode()
+                source = Source("lib.rs", original, Cfg([]))
+                rendered = source.render(set(), set())
+                self.assertIn(b"\n}\n" + original.split(b"\n")[0], rendered.data)
+                self.assertTrue(rendered.checked(original.index(b"pub fn f")))
+                self.assertTrue(rendered.checked(original.index(b"pub fn ordinary")))
+
+    def test_source_view_uses_native_cfg_without_disabling_explicit_ghost_builds(self):
+        original = (
+            "#[cfg(verus_keep_ghost)] use crate::specs;\n"
+            "#[cfg_attr(verus_keep_ghost, verus_spec(ensures true))]\n"
+            "pub fn f() -> u32 { #[cfg(verus_keep_ghost)] proof! {} 1 }\n"
+            "#[cfg(not(verus_keep_ghost))] pub fn runtime_only() {}\n"
+        ).encode()
+        for flags in (["unix"], ["unix", "verus_keep_ghost"]):
+            with self.subTest(flags=flags):
+                cfg = source_configuration({"rust_cfg": flags, "source_cfg": flags})
+                model = Source("lib.rs", original, cfg)
+                rendered = model.render(set(), set(), wrap=False)
+                ghost = "verus_keep_ghost" in flags
+                self.assertEqual(b"crate::specs" in rendered.data, ghost)
+                self.assertEqual(b"verus_spec" in rendered.data, ghost)
+                self.assertEqual(b"proof!" in rendered.data, ghost)
+                self.assertEqual(b"runtime_only" in rendered.data, not ghost)
+                self.assertIn(b"pub fn f()", rendered.data)
+
+    def test_saved_source_cfg_preserves_legacy_evidence_and_rejects_invalid_values(self):
+        self.assertIn("verus_keep_ghost", source_configuration({"rust_cfg": []}).values)
+        self.assertEqual(source_configuration({"rust_cfg": [], "source_cfg": []}).values, set())
+        for value in ("unix", [1], None):
+            with self.subTest(value=value), self.assertRaisesRegex(GapError, "source configuration"):
+                source_configuration({"rust_cfg": [], "source_cfg": value})
+
     def test_prepared_models_round_trip_without_parsing_or_rebuilding_the_index(self):
         source = Source("lib.rs", (
             'use ::core::arch;\n'
@@ -200,6 +249,65 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn(b"bad", rendered.data)
         self.assertIn(b"#[inline]", rendered.data)
         self.assertEqual([item.name for item in source.functions], ["f"])
+
+    def test_inactive_braced_statement_macro_preserves_following_expression(self):
+        for suffix in (
+            "(1, 2)", "(1, 2);", "(1, 2).0", "((1, 2))",
+            "(|x| x)(1)", "/* retained */ (1, 2)",
+        ):
+            with self.subTest(suffix=suffix):
+                original = (
+                    "fn f() {\n#[cfg(verus_keep_ghost)]\n"
+                    "proof! { assert(true); }\n" + suffix + "\n}\n"
+                ).encode()
+                source = Source("lib.rs", original, Cfg([]))
+                rendered = source.render(set(), set(), wrap=False)
+                self.assertNotIn(b"proof!", rendered.data)
+                self.assertIn(suffix.encode(), rendered.data)
+                self.assertEqual(rendered.data.count(b"\n"), original.count(b"\n"))
+                offset = rendered.data.index(suffix.encode())
+                self.assertEqual(rendered.location(offset)["byte"], original.index(suffix.encode()))
+
+    def test_braced_statement_macro_with_semicolon_and_active_cfg(self):
+        for separator in (" ", "\n", ";\n"):
+            original = (
+                "fn f() { #[cfg(unix)] custom! {}" + separator + "(1, 2) }\n"
+            ).encode()
+            inactive = Source("lib.rs", original, Cfg([])).render(set(), set(), wrap=False)
+            self.assertNotIn(b"custom!", inactive.data)
+            self.assertIn(b"(1, 2)", inactive.data)
+            active = Source("lib.rs", original, Cfg(["unix"])).render(set(), set(), wrap=False)
+            self.assertIn(b"custom! {}" + separator.encode() + b"(1, 2)", active.data)
+
+    def test_inactive_macro_result_calls_in_expression_context_are_removed_completely(self):
+        for statement in (
+            "let value = custom! {}(1, 2);",
+            "return custom! {}(1, 2);",
+            "(custom! {})(1, 2);",
+            "custom! ()(1, 2);",
+            "custom! [](1, 2);",
+        ):
+            with self.subTest(statement=statement):
+                original = (
+                    "fn f() { #[cfg(unix)] " + statement + " (3, 4) }\n"
+                ).encode()
+                rendered = Source("lib.rs", original, Cfg([])).render(set(), set(), wrap=False)
+                self.assertNotIn(b"custom!", rendered.data)
+                self.assertNotIn(b"(1, 2)", rendered.data)
+                self.assertIn(b"(3, 4)", rendered.data)
+
+    def test_retained_macro_suffix_is_indexed_and_prepared_in_nested_block(self):
+        original = (
+            "fn outer() { {\n#[cfg(verus_keep_ghost)] proof! {}\n"
+            "(|| { #[cfg(windows)] missing(); fn nested() {} nested(); })();\n"
+            "} }\n"
+        ).encode()
+        source = Source("lib.rs", original, Cfg([]))
+        self.assertEqual([item.name for item in source.functions], ["outer", "outer::nested"])
+        rendered = source.render(set(), set(), wrap=False)
+        self.assertNotIn(b"proof!", rendered.data)
+        self.assertNotIn(b"missing", rendered.data)
+        self.assertIn(b"fn nested() {} nested();", rendered.data)
 
     def test_const_lifetimes_explicit_without_changing_function_types(self):
         source = Source("lib.rs", (

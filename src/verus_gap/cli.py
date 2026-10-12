@@ -307,6 +307,8 @@ def main(argv: list[str] | None = None) -> int:
                                help="disable project and bundled build configurations; keep Cargo defaults")
     parser.add_argument("--package", help="crate name when the workspace is ambiguous")
     parser.add_argument("--bin", help="binary target when there is no unique library")
+    parser.add_argument("--input-kind", choices=("rust", "verus"),
+                        help="rust: scan the native build (default); verus: use an existing .rs proof root and its annotations")
     parser.add_argument("--file", action="append", default=[], help="file or glob relative to workspace or crate")
     parser.add_argument("--scan-level", type=int, choices=(0, 1, 2),
                         help="0: expand dependencies; 1: selected source with continued isolation; "
@@ -321,6 +323,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verus", help="existing complete Verus distribution")
     parser.add_argument("--timeout", type=float, default=3600, help="total build/scan budget in seconds")
     args = parser.parse_args(values)
+    if args.input_kind == "verus":
+        if Path(args.path).suffix != ".rs":
+            parser.error("--input-kind verus requires an explicit .rs proof root")
+        if args.features or args.package or args.bin:
+            parser.error("--input-kind verus accepts Rust compiler arguments after --, not Cargo selectors")
+        args.standalone = True
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.jobs <= 0:
@@ -335,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--resume reuses its result directory; do not also pass --out")
     if args.resume and (
         args.features or cargo or args.package or args.bin or args.verus or args.config or args.no_config
+        or args.input_kind
     ):
         parser.error("A resumed scan keeps its original compiler/build context; start a new scan to change it.")
     output = Path(args.resume or args.out).expanduser().resolve() if args.resume or args.out else (

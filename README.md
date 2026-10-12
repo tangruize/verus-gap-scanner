@@ -55,6 +55,10 @@ Pass a source file or module directory instead of the whole crate, or select fil
 
 Only files active in the chosen Cargo configuration are scanned. Use `--features FEATURE` to include optional code; `full` is not enabled automatically. For an ambiguous workspace, choose `--package NAME` or pass the crate's directory. Use `--bin NAME` to select a binary.
 
+### Projects with existing Verus code
+
+For ordinary Cargo scans, ghost-only proof annotations stay disabled when the original build disables them; executable bodies still get scanned. Crates needing Cargo-Verus dependencies retain the matching ghost-aware source context, labeled in the report. For a Verus proof entry point rather than its ordinary Cargo build, use `./verus-gap /path/to/proof_root.rs --input-kind verus --jobs 32 --verbose`. This retains existing annotations and uses Verus compilation controls without SMT verification; it does not re-prove the project or remove its existing trust boundaries. See [existing Verus code](doc/REFERENCE.md#code-with-existing-verus-annotations) for dependencies and scope limits.
+
 ### Optional build configuration
 
 Some projects rely on a Makefile or CI recipe to supply a custom target, features, or build-script environment variables. If the unchanged Rust build fails, inspect the reported error and `baseline.stdout` / `baseline.stderr`. Missing build context is a setup problem, not a Verus limitation; a configuration can supply those settings but cannot fix invalid Rust or missing tools.

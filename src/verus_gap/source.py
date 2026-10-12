@@ -317,10 +317,46 @@ class Source:
                 return False
         return True
 
-    def _collect(self, node: Node, parent: Declaration | None = None, enabled: bool = True):
+    def _inactive_end(self, node: Node) -> int:
+        if node.parent is None or node.parent.type != "block":
+            return node.end_byte
+        expression = node
+        if expression.type == "expression_statement":
+            expression = next(
+                (child for child in expression.named_children
+                 if child.type not in {"attribute_item", "line_comment", "block_comment"}),
+                expression,
+            )
+        end = expression.end_byte
+        while expression.type in {
+            "call_expression", "field_expression", "index_expression",
+            "try_expression", "await_expression",
+        }:
+            field = "function" if expression.type == "call_expression" else "value"
+            child = expression.child_by_field_name(field)
+            child = child if child is not None else next(iter(expression.named_children), None)
+            if child is None:
+                break
+            expression = child
+        if expression.type == "macro_invocation" and expression.end_byte < end:
+            tokens = next(
+                (child for child in expression.named_children if child.type == "token_tree"), None,
+            )
+            if tokens is not None and self.data[tokens.start_byte:tokens.start_byte + 1] == b"{":
+                # Rust ends a braced statement macro here; tree-sitter can absorb the next tuple.
+                return expression.end_byte
+        return node.end_byte
+
+    def _collect(self, node: Node, parent: Declaration | None = None, enabled: bool = True,
+                 inactive_until: int | None = None):
+        if inactive_until is not None and node.start_byte >= inactive_until:
+            enabled, inactive_until = True, None
         attributes = self._attrs(node)
         attrs = [self._text(attribute) for attribute in attributes]
-        enabled = enabled and self._enabled(attrs)
+        if enabled and not self._enabled(attrs):
+            enabled = False
+            end = self._inactive_end(node)
+            inactive_until = end if end < node.end_byte else None
         if node.type in {"ERROR"} or node.is_missing:
             self.parse_errors.append({
                 "start": node.start_byte, "end": node.end_byte,
@@ -356,7 +392,7 @@ class Source:
             self.declarations.append(current)
         if recurse:
             for child in node.named_children:
-                self._collect(child, current, enabled)
+                self._collect(child, current, enabled, inactive_until)
 
     def _prepare(self, node: Node):
         if any(
@@ -365,6 +401,54 @@ class Source:
             for edit in self.preparation
         ):
             return
+        if node.type in {"token_tree", "line_comment", "block_comment", "attribute_item"}:
+            return
+        attrs = self._attrs(node)
+        if "verus_keep_ghost" in self.cfg.values:
+            # Verus changes this flag between checking and ghost-erasure passes.
+            attrs = [
+                attribute for attribute in attrs
+                if not re.search(r"\bverus_keep_ghost_body\b", self._text(attribute))
+            ]
+        if attrs and not self._enabled([self._text(attribute) for attribute in attrs]):
+            last = node
+            if node.type == "visibility_modifier" and node.parent.type == "ordered_field_declaration_list":
+                last = node.next_named_sibling
+                while last is not None and last.type in {"line_comment", "block_comment"}:
+                    last = last.next_named_sibling
+                if last is None:
+                    raise GapError(f"Cannot resolve a cfg tuple field in {self.file}.")
+            end = self._inactive_end(last)
+            if last.next_sibling is not None and last.next_sibling.type == ",":
+                end = last.next_sibling.end_byte
+            start = min(attrs[0].start_byte, self._leading_start(node))
+            self.preparation.append(Edit(
+                start, end, "\n" * self.data[
+                    start:end
+                ].count(b"\n"), "inactive cfg before Verus macro expansion",
+            ))
+            if end < node.end_byte:
+                for child in node.named_children:
+                    if child.end_byte > end:
+                        self._prepare(child)
+            return
+        for attribute in attrs:
+            text = self._text(attribute)
+            match = re.fullmatch(r"#\[\s*cfg\s*\((.*)\)\s*\]", text, re.S)
+            if match:
+                self.preparation.append(Edit(
+                    attribute.start_byte, attribute.end_byte, "",
+                    "resolved active cfg before Verus macro expansion",
+                ))
+            elif self.cfg.attribute(text) != [text]:
+                replacement = "\n".join(
+                    resolved for resolved in self.cfg.attribute(text)
+                    if not re.fullmatch(r"#\[\s*cfg\s*\((.*)\)\s*\]", resolved, re.S)
+                )
+                self.preparation.append(Edit(
+                    attribute.start_byte, attribute.end_byte, replacement,
+                    "resolved conditional attribute before Verus macro expansion",
+                ))
         if node.type == "macro_invocation":
             path = node.child_by_field_name("macro")
             parts = self._text(path).split("::")
@@ -405,47 +489,8 @@ class Source:
                             break
                     scope = scope.parent
             return
-        if node.type in {
-            "macro_definition", "token_tree",
-            "line_comment", "block_comment", "attribute_item",
-        }:
+        if node.type == "macro_definition":
             return
-        attrs = self._attrs(node)
-        if attrs and not self._enabled([self._text(attribute) for attribute in attrs]):
-            last = node
-            if node.type == "visibility_modifier" and node.parent.type == "ordered_field_declaration_list":
-                last = node.next_named_sibling
-                while last is not None and last.type in {"line_comment", "block_comment"}:
-                    last = last.next_named_sibling
-                if last is None:
-                    raise GapError(f"Cannot resolve a cfg tuple field in {self.file}.")
-            end = last.end_byte
-            if last.next_sibling is not None and last.next_sibling.type == ",":
-                end = last.next_sibling.end_byte
-            start = min(attrs[0].start_byte, self._leading_start(node))
-            self.preparation.append(Edit(
-                start, end, "\n" * self.data[
-                    start:end
-                ].count(b"\n"), "inactive cfg before Verus macro expansion",
-            ))
-            return
-        for attribute in attrs:
-            text = self._text(attribute)
-            match = re.fullmatch(r"#\[\s*cfg\s*\((.*)\)\s*\]", text, re.S)
-            if match:
-                self.preparation.append(Edit(
-                    attribute.start_byte, attribute.end_byte, "",
-                    "resolved active cfg before Verus macro expansion",
-                ))
-            elif self.cfg.attribute(text) != [text]:
-                replacement = "\n".join(
-                    resolved for resolved in self.cfg.attribute(text)
-                    if not re.fullmatch(r"#\[\s*cfg\s*\((.*)\)\s*\]", resolved, re.S)
-                )
-                self.preparation.append(Edit(
-                    attribute.start_byte, attribute.end_byte, replacement,
-                    "resolved conditional attribute before Verus macro expansion",
-                ))
         if node.type == "const_item":
             ty = node.child_by_field_name("type")
 
@@ -537,6 +582,11 @@ class Source:
         attributed = {
             item.id for item in self.declarations if item.parent is None and item.id in verified
         } | promoted
+        attributed |= {
+            item.id for item in self.declarations if item.enabled and item.parent is None
+            and item.kind == "macro_invocation"
+            and item.name.split("::")[-1] in {"verus", "state_machine", "tokenized_state_machine"}
+        }
         checked_outside = attributed - (unwrapped or set())
         outside = [
             item for item in self.declarations if item.enabled

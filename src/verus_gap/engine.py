@@ -269,7 +269,10 @@ def execute(project: Project, state: State, directory: Path, timeout: float) -> 
             scoped = name in state.scope
             mapped = source.render(
                 state.bodies.get(name, set()), state.external.get(name, set()) | modules.get(name, set()),
-                wrap=scoped, prepare=scoped, unwrapped=state.unwrapped.get(name, set()),
+                wrap=scoped, prepare=scoped or project.manifest.get(
+                    "source_configuration_origin", "native" if "source_cfg" in project.manifest else "legacy",
+                ) == "native",
+                unwrapped=state.unwrapped.get(name, set()),
                 load_support=name == project.manifest["root_source"],
                 support_crate=project.manifest.get("support_crate_name", "vstd"),
             )

@@ -19,7 +19,7 @@ from urllib.parse import quote
 from .configuration import validate_saved_configuration
 from .engine import canonical
 from .gap import GapError
-from .project import Project, scan_level_from
+from .project import Project, scan_level_from, source_configuration
 from .source import Cfg, Source
 
 LABELS = {
@@ -190,6 +190,9 @@ def aggregate(project: Project, shards: list[dict], selected: list[str]) -> dict
         "schema": "verus-gap/inventory-v2", "project": project.manifest["input"],
         "package": project.manifest["package"], "verus": project.manifest["verus"],
         "baseline_passed": project.manifest["baseline_passed"],
+        "baseline_kind": project.manifest.get("baseline_kind", "rust"),
+        "input_kind": project.manifest.get("input_kind", "rust"),
+        "source_configuration_origin": project.manifest.get("source_configuration_origin", "legacy"),
         "cargo_args": project.manifest["cargo_args"], "complete_inventory": False,
         "build_configuration": project.manifest.get("build_configuration"),
         "checks": project.manifest["checks"],
@@ -362,6 +365,9 @@ def markdown(report: dict) -> str:
     library = report["counts"].get("library_specification", 0)
     level = scan_level_from(report)
     fast = level > 0
+    build_label = "Verus compile (SMT disabled)" if report.get("baseline_kind") == "verus_compile" else "Rust build"
+    argument_label = "Compiler arguments" if report.get("input_kind") == "verus" else "Cargo configuration"
+    argument_default = "default" if report.get("input_kind") == "verus" else "default features"
     lines = [
         "# Verus compatibility inventory", "",
         *snapshot_lines(report),
@@ -370,15 +376,21 @@ def markdown(report: dict) -> str:
         f"{coverage['partial_files']} file frontiers remain partial.",
         "", f"**Project:** `{report['project']}`",
         f"**Crate:** `{report['package']}`; **Verus:** `{report['verus']['version']}`.",
-        f"**Unchanged Rust build:** {'passed' if report['baseline_passed'] else 'failed'}. "
-        f"**Cargo configuration:** `{' '.join(report['cargo_args']) or 'default features'}`.", "",
+        f"**Unchanged {build_label}:** {'passed' if report['baseline_passed'] else 'failed'}. "
+        f"**{argument_label}:** `{' '.join(report['cargo_args']) or argument_default}`.", "",
         *([
             f"**Build configuration:** `{Path(report['build_configuration']['path']).name}` "
             f"(`{report['build_configuration']['selection']}`); "
             f"[saved TOML]({report['build_configuration']['snapshot']}).", "",
         ] if report.get("build_configuration") else []),
         *([
-            f"**Scan level: {level}{' (fast)' if level == 2 else ''}, selected source only.** The native Cargo context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
+            "**Input view: existing Verus root.** The supplied proof root, ghost code, contracts, and existing external/trusted boundaries are retained. Both build controls use Verus compilation with SMT disabled; no ordinary Rust baseline or new proof is claimed. Macro-contained functions are not individually indexed or isolated. Clear frontiers mean compiler acceptance in this annotated context, not support for all equivalent unannotated Rust.", "",
+        ] if report.get("input_kind") == "verus" else []),
+        *([
+            "**Source view: Cargo-Verus dependency context.** This crate requires Verus-aware dependencies. Source conditions use the captured Verus driver's configuration to match those dependency artifacts, preserving required proof/spec definitions. The original native build and its preparation control are retained separately; this is not a proof or a claim that every native-only branch was checked.", "",
+        ] if report.get("source_configuration_origin") == "cargo_verus" else []),
+        *([
+            f"**Scan level: {level}{' (fast)' if level == 2 else ''}, selected source only.** The captured build context and controls are retained, but dependency files are not recursively added to Verus checking. Grouped findings require a primary location in the selected source. Uncrossed local boundaries can hide later findings; a dependency-limited frontier is kept partial even if exclusions remove the final compiler errors. Complete raw output remains in the per-round evidence.", "",
         ] if fast else [
             "**Scan level: 0.** Uniquely indexed local dependencies may be added to checking; isolation continues while the frontier makes progress.", "",
         ]),
@@ -397,7 +409,7 @@ def markdown(report: dict) -> str:
         "", "Library groups below are labeled with public API names when the compiler supplies them. Unstable compiler definition numbers are normalized only for grouping; every raw diagnostic is unchanged.",
         "", "## Coverage", "",
         "| Measure | Count |", "|---|---:|",
-        f"| Active files in the captured Rust build | {coverage['active_files']} |",
+        f"| Active files in the captured build | {coverage['active_files']} |",
         f"| Independently probed / selected files | {coverage['probed_files']} / {coverage['selected_files']} |",
         f"| Additional files reached through local context expansion | {coverage['expanded_context_files']} |",
         f"| Active generated/external source files outside the editable copy | {coverage['unindexed_external_active_sources']} |",
@@ -416,7 +428,7 @@ def markdown(report: dict) -> str:
         f"| Macro invocation sites (generated declarations not fully enumerable) | {coverage['macro_sites']} |",
         "", "The active-file denominator comes from the unchanged native Rust build. Ghost-only includes and macro-generated declarations may add context that is not fully indexed. Dependency expansion is source indexing, not a semantic call graph.",
         "", "## Setup and controls", "",
-        f"**Syntax-only preparation Rust recheck:** `{'passed' if (report.get('preparation_check') or {}).get('exit_code') == 0 else 'not recorded'}`. "
+        f"**Syntax-only preparation {'Verus' if report.get('input_kind') == 'verus' else 'Rust'} recheck:** `{'passed' if (report.get('preparation_check') or {}).get('exit_code') == 0 else 'not recorded'}`. "
         f"**Support mode:** `{report.get('support_mode')}`. "
         f"**SMT verification:** `off`; **proof lifetime checks:** `{'on' if report['checks']['proof_lifetimes'] else 'off'}`.", "",
     ]
@@ -703,7 +715,7 @@ def _refresh_report(output: Path) -> dict:
     if "workers_restored" in manifest and type(manifest["workers_restored"]) is not bool:
         raise GapError("The saved worker restoration state is invalid.")
     validate_saved_configuration(output, manifest.get("build_configuration"))
-    cfg = Cfg([*manifest["rust_cfg"], "verus_keep_ghost", "verus_keep_ghost_body", "verus_only"])
+    cfg = source_configuration(manifest)
     sources = {}
     for name, identity in active.items():
         if not isinstance(name, str) or not isinstance(identity, dict) or not isinstance(identity.get("sha256"), str):

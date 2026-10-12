@@ -110,6 +110,27 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(report["scan_progress"]["state"], "incomplete")
             self.assertEqual(report["scan_progress"]["active_file"], shard["focus"])
 
+    def test_refresh_reconstructs_the_saved_source_view(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, manifest, _, _ = self.saved_result(temporary)
+            original = (
+                b"#[cfg(verus_keep_ghost)] pub fn proof_only() {}\n"
+                b"pub fn example() {}\n"
+            )
+            (output / "originals/src/lib.rs").write_bytes(original)
+            for flags in ([], ["verus_keep_ghost"]):
+                manifest["source_cfg"] = flags
+                source = Source("src/lib.rs", original, Cfg(flags))
+                manifest["active_sources"] = {source.file: source.identity()}
+                write_json(output / "project.json", manifest)
+                with mock.patch("verus_gap.report.Source", wraps=Source) as constructing:
+                    refresh_report(output)
+                    self.assertEqual(constructing.call_args.args[2].values, set(flags))
+            manifest["source_cfg"] = "invalid"
+            write_json(output / "project.json", manifest)
+            with self.assertRaisesRegex(GapError, "source configuration"):
+                refresh_report(output)
+
     def test_manual_refresh_retains_configuration_without_its_input_file_and_rejects_tampering(self):
         with tempfile.TemporaryDirectory() as temporary:
             output, manifest, _, _ = self.saved_result(temporary)
